@@ -16,13 +16,14 @@
 #include "stratum_api.h"
 #include "stratum_v2_task.h"
 #include "utils.h"
+#include "pool_split.h"
 
 static const char *TAG = "create_jobs_task";
 
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty, const char *extranonce_str, int extranonce_2_len, uint32_t version_mask, int pool_index);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
 
@@ -62,6 +63,35 @@ void create_jobs_task(void *pvParameters)
             ESP_LOGI(TAG, "Resetting extranonce2 to 0 due to set_extranonce request");
             extranonce_2 = 0;
             GLOBAL_STATE->reset_extranonce2 = false;
+        }
+
+        if (pool_split_is_active()) {
+            int slot = pool_split_take_job_slot();
+            if (slot < 0) {
+                vTaskDelay(50 / portTICK_PERIOD_MS);
+                continue;
+            }
+            CosteanPoolRuntime *rt = pool_split_get(slot);
+            if (!rt || xSemaphoreTake(rt->lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+                continue;
+            }
+            if (!rt->current_notify || !rt->extranonce_str) {
+                xSemaphoreGive(rt->lock);
+                continue;
+            }
+            uint64_t en2 = rt->extranonce_2++;
+            double diff = rt->difficulty;
+            const char *en = rt->extranonce_str;
+            int en2len = rt->extranonce_2_len;
+            uint32_t vmask = rt->version_mask;
+            int pidx = rt->pool_index;
+            if (GLOBAL_STATE->ASIC_initalized) {
+                ASIC_set_version_mask(GLOBAL_STATE, vmask);
+            }
+            generate_work(GLOBAL_STATE, rt->current_notify, en2, diff, en, en2len, vmask, pidx);
+            xSemaphoreGive(rt->lock);
+            timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+            continue;
         }
 
         // Read protocol dynamically each iteration (coordinator may have switched it)
@@ -182,24 +212,32 @@ void create_jobs_task(void *pvParameters)
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
-            generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
+            generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty,
+                          NULL, 0, 0, -1);
             extranonce_2++;
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
 
-static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty)
+static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty,
+                          const char *extranonce_str, int extranonce_2_len, uint32_t version_mask, int pool_index)
 {
-    if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
+    if (!extranonce_str) {
+        extranonce_str = GLOBAL_STATE->extranonce_str;
+        extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
+        version_mask = GLOBAL_STATE->version_mask;
+        pool_index = -1;
+    }
+    if (extranonce_2_len > MAX_EXTRANONCE2_LEN) {
+        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job", extranonce_2_len, MAX_EXTRANONCE2_LEN);
         return;
     }
     char extranonce_2_str[MAX_EXTRANONCE2_STR];
-    extranonce_2_generate(extranonce_2, GLOBAL_STATE->extranonce_2_len, extranonce_2_str);
+    extranonce_2_generate(extranonce_2, extranonce_2_len, extranonce_2_str);
 
     uint8_t coinbase_tx_hash[32];
-    calculate_coinbase_tx_hash(notification->coinbase_1, notification->coinbase_2, GLOBAL_STATE->extranonce_str, extranonce_2_str, coinbase_tx_hash);
+    calculate_coinbase_tx_hash(notification->coinbase_1, notification->coinbase_2, extranonce_str, extranonce_2_str, coinbase_tx_hash);
 
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
@@ -211,11 +249,12 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         return;
     }
 
-    construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
+    construct_bm_job(notification, merkle_root, version_mask, difficulty, next_job);
 
     next_job->extranonce2 = strdup(extranonce_2_str);
     next_job->jobid = strdup(notification->job_id);
-    next_job->version_mask = GLOBAL_STATE->version_mask;
+    next_job->version_mask = version_mask;
+    next_job->pool_index = (int8_t)pool_index;
 
     // Check if ASIC is initialized before trying to send work
     if (!GLOBAL_STATE->ASIC_initalized) {

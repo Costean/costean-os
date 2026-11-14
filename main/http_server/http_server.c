@@ -29,6 +29,9 @@
 #include "cJSON.h"
 #include "global_state.h"
 #include "nvs_config.h"
+#include "pool_split.h"
+#include "discord_alerts.h"
+#include "costean/costean_core.h"
 #include "system.h"
 #include "connect.h"
 #include "statistics_task.h"
@@ -771,6 +774,7 @@ static bool validate_pool_json(const cJSON *pool_item, int i) {
 
     if (!validate_string_field(cJSON_GetObjectItem(pool_item, "stratumV2AuthorityPubkey"), "stratumV2AuthorityPubkey", 128, i)) return false;
     if (!validate_bool_or_num(cJSON_GetObjectItem(pool_item, "stratumV2RequireAuth"), "stratumV2RequireAuth", i)) return false;
+    if (!validate_number_range(cJSON_GetObjectItem(pool_item, "splitPercent"), "splitPercent", 0, 100, i)) return false;
 
     return true;
 }
@@ -815,6 +819,7 @@ static void update_pool_nvs(const cJSON *pool_item, int i) {
     add_string_field_default(p_obj, pool_item, "stratumV2ChannelType", SV2_CHANNEL_TYPE_EXTENDED);
     add_string_field_default(p_obj, pool_item, "stratumV2AuthorityPubkey", "");
     add_bool_field_default(p_obj, pool_item, "stratumV2RequireAuth", false);
+    add_number_field_default(p_obj, pool_item, "splitPercent", 0);
 
     char *json_str = cJSON_PrintUnformatted(p_obj);
     if (json_str) {
@@ -951,6 +956,54 @@ bool check_settings_and_update(const cJSON * const root, char **redirect_url)
         }
     }
 
+    /* Validate a requested pool split against the pools that will be stored. */
+    cJSON *split_en = cJSON_GetObjectItem(root, "poolSplitEnabled");
+    if (result && split_en && (cJSON_IsTrue(split_en) || (cJSON_IsNumber(split_en) && split_en->valueint != 0))) {
+        pool_split_config_t scfg;
+        memset(&scfg, 0, sizeof(scfg));
+        scfg.count = COSTEAN_MAX_SPLIT_POOLS;
+        for (int i = 0; i < COSTEAN_MAX_SPLIT_POOLS; i++) {
+            PoolConfig *pc = &GLOBAL_STATE->SYSTEM_MODULE.pools[i];
+            scfg.percent[i] = pc->split_percent;
+            scfg.is_sv2[i] = (pc->protocol == STRATUM_PROTOCOL_V2);
+            scfg.has_url[i] = (pc->url && pc->url[0] != '\0');
+        }
+        if (pools_item && cJSON_IsArray(pools_item)) {
+            int size = cJSON_GetArraySize(pools_item);
+            for (int i = 0; i < size; i++) {
+                cJSON *pool_item = cJSON_GetArrayItem(pools_item, i);
+                cJSON *id_item = cJSON_GetObjectItem(pool_item, "id");
+                if (!id_item || !cJSON_IsNumber(id_item)) continue;
+                int idx = id_item->valueint;
+                if (idx < 0 || idx >= COSTEAN_MAX_SPLIT_POOLS) continue;
+                cJSON *sp = cJSON_GetObjectItem(pool_item, "splitPercent");
+                if (cJSON_IsNumber(sp)) scfg.percent[idx] = (uint16_t)sp->valueint;
+                cJSON *url = cJSON_GetObjectItem(pool_item, "stratumURL");
+                scfg.has_url[idx] = url && cJSON_IsString(url) && url->valuestring && url->valuestring[0];
+                cJSON *proto = cJSON_GetObjectItem(pool_item, "stratumProtocol");
+                scfg.is_sv2[idx] = proto && cJSON_IsString(proto) && strcmp(proto->valuestring, "SV2") == 0;
+            }
+        }
+        pool_split_error_t err = pool_split_validate(&scfg, true);
+        if (err != POOL_SPLIT_OK) {
+            ESP_LOGW(TAG, "Rejected pool split: %s", pool_split_error_string(err));
+            result = false;
+        }
+    }
+
+    cJSON *hook_item = cJSON_GetObjectItem(root, "discordWebhook");
+    if (hook_item && !cJSON_IsString(hook_item)) {
+        ESP_LOGW(TAG, "discordWebhook must be a string");
+        result = false;
+    } else if (hook_item && hook_item->valuestring[0] != '\0') {
+        const char *u = hook_item->valuestring;
+        if (strncmp(u, "https://", 8) != 0 ||
+            (strstr(u, "discord.com/api/webhooks/") == NULL && strstr(u, "discordapp.com/api/webhooks/") == NULL)) {
+            ESP_LOGW(TAG, "discordWebhook is not a Discord webhook URL");
+            result = false;
+        }
+    }
+
     if (result) {
         // update NVS (if result is okay) and clean up    
         for (NvsConfigKey key = 0; key < NVS_CONFIG_COUNT; key++) {
@@ -995,6 +1048,10 @@ bool check_settings_and_update(const cJSON * const root, char **redirect_url)
                     nvs_config_set_float(key, (float)item->valuedouble);
                     break;
             }
+        }
+
+        if (hook_item && cJSON_IsString(hook_item)) {
+            nvs_config_set_string(NVS_CONFIG_DISCORD_WEBHOOK, hook_item->valuestring);
         }
 
         // Save pools array to NVS
@@ -1187,6 +1244,7 @@ static esp_err_t POST_restart(httpd_req_t * req)
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     // Restart the system
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     // This return statement will never be reached, but it's good practice to include it
@@ -1376,6 +1434,97 @@ static esp_err_t POST_mining_resume(httpd_req_t * req)
     return res;
 }
 
+static esp_err_t POST_discord_test(httpd_req_t * req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    cJSON *resp = cJSON_CreateObject();
+    if (!discord_webhook_is_configured()) {
+        cJSON_AddBoolToObject(resp, "ok", false);
+        cJSON_AddStringToObject(resp, "message", "No Discord webhook is configured");
+        HTTP_send_json(req, resp, &api_common_prebuffer_len);
+        cJSON_Delete(resp);
+        return ESP_OK;
+    }
+    bool queued = discord_alerts_send_test();
+    cJSON_AddBoolToObject(resp, "ok", queued);
+    cJSON_AddStringToObject(resp, "message", queued ? "Test message queued" : "Failed to queue test message");
+    HTTP_send_json(req, resp, &api_common_prebuffer_len);
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
+/* Costean OS: GET /api/costean (status + config), GET /api/costean/history, PATCH /api/costean */
+static esp_err_t GET_costean(httpd_req_t * req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    cJSON *root;
+    if (strncmp(req->uri, "/api/costean/history", 20) == 0) {
+        root = costean_history_json();
+    } else if (strcmp(req->uri, "/api/costean") == 0 || strncmp(req->uri, "/api/costean?", 13) == 0) {
+        root = cJSON_CreateObject();
+        cJSON_AddItemToObject(root, "status", costean_status_json());
+        cJSON_AddItemToObject(root, "config", costean_config_json());
+    } else {
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+    }
+    esp_err_t res = HTTP_send_json(req, root, &api_common_prebuffer_len);
+    cJSON_Delete(root);
+    return res;
+}
+
+static esp_err_t PATCH_costean(httpd_req_t * req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    int total_len = req->content_len;
+    char * buf = ((rest_server_context_t *) (req->user_ctx))->scratch;
+    if (total_len <= 0 || total_len >= SCRATCH_BUFSIZE) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad length");
+    }
+    int cur_len = 0;
+    while (cur_len < total_len) {
+        int received = httpd_req_recv(req, buf + cur_len, total_len - cur_len);
+        if (received <= 0) {
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "receive failed");
+        }
+        cur_len += received;
+    }
+    buf[total_len] = '\0';
+    cJSON *body = cJSON_Parse(buf);
+    if (!body) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    }
+    const char *err = costean_patch_config(body);
+    cJSON_Delete(body);
+    if (err) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+    }
+    httpd_resp_set_type(req, "application/json");
+    cJSON *cfg = costean_config_json();
+    esp_err_t res = HTTP_send_json(req, cfg, &api_common_prebuffer_len);
+    cJSON_Delete(cfg);
+    return res;
+}
+
 /* Simple handler for getting system handler */
 static esp_err_t GET_system_info(httpd_req_t * req)
 {
@@ -1491,6 +1640,7 @@ static esp_err_t POST_system_boot(httpd_req_t *req)
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     // Restart the system
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     return send_res;
@@ -1733,6 +1883,7 @@ esp_err_t POST_WWW_update(httpd_req_t * req)
     snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Rebooting...");
     vTaskDelay(1000 / portTICK_PERIOD_MS);
     GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = false;
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     return ESP_OK;
@@ -1817,6 +1968,7 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
     httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
     ESP_LOGI(TAG, "Restarting System because of Firmware update complete");
     vTaskDelay(1000 / portTICK_PERIOD_MS);
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     return ESP_OK;
@@ -1852,7 +2004,7 @@ esp_err_t start_rest_server(GlobalState * global_state)
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
     config.max_open_sockets = 20;
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 30;
     config.close_fn = websocket_close_fn;
     config.lru_purge_enable = true;
     config.keep_alive_enable = true;
@@ -1981,6 +2133,30 @@ esp_err_t start_rest_server(GlobalState * global_state)
         .user_ctx = NULL
     };
     httpd_register_uri_handler(server, &system_dismiss_block_found_uri);
+
+    httpd_uri_t system_discord_test_uri = {
+        .uri = "/api/system/discord/test",
+        .method = HTTP_POST,
+        .handler = POST_discord_test,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &system_discord_test_uri);
+
+    httpd_uri_t costean_get_uri = {
+        .uri = "/api/costean*",
+        .method = HTTP_GET,
+        .handler = GET_costean,
+        .user_ctx = rest_context
+    };
+    httpd_register_uri_handler(server, &costean_get_uri);
+
+    httpd_uri_t costean_patch_uri = {
+        .uri = "/api/costean",
+        .method = HTTP_PATCH,
+        .handler = PATCH_costean,
+        .user_ctx = rest_context
+    };
+    httpd_register_uri_handler(server, &costean_patch_uri);
 
     httpd_uri_t update_system_settings_uri = {
         .uri = "/api/system", 

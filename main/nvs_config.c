@@ -127,6 +127,15 @@ static Settings settings[NVS_CONFIG_COUNT] = {
     [NVS_CONFIG_TPS546_SYNC_CONFIG]                    = {.nvs_key_name = "tps546_sync",    .type = TYPE_U16},
     [NVS_CONFIG_TPS546_FREQUENCY]                      = {.nvs_key_name = "tps546_freq",    .type = TYPE_U16},
     [NVS_CONFIG_NOMINAL_VOLTAGE]                       = {.nvs_key_name = "nominal_voltage", .type = TYPE_U16},
+
+    [NVS_CONFIG_POOL_SPLIT_ENABLED]                    = {.nvs_key_name = "poolsplit",       .type = TYPE_BOOL,                                                                         .rest_name = "poolSplitEnabled",                   .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_WEBHOOK]                       = {.nvs_key_name = "dcwebhook",       .type = TYPE_STR,   .default_value = {.str = ""},                                          .min = 0,  .max = NVS_STR_LIMIT},
+    [NVS_CONFIG_DISCORD_ENABLED]                       = {.nvs_key_name = "dcenabled",       .type = TYPE_BOOL,                                                                         .rest_name = "discordEnabled",                     .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_BLOCK_FOUND]                   = {.nvs_key_name = "dcblock",         .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordBlockFound",                  .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_BEST_DIFF]                     = {.nvs_key_name = "dcbestdiff",      .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordBestDiff",                    .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_OFFLINE]                       = {.nvs_key_name = "dcoffline",       .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordOffline",                     .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_OVERHEAT]                      = {.nvs_key_name = "dcoverheat",      .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordOverheat",                    .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_STATUS_MINUTES]                = {.nvs_key_name = "dcstatusmin",     .type = TYPE_U16,                                                                          .rest_name = "discordStatusMinutes",               .min = 0,  .max = 1440},
 };
 
 Settings *nvs_config_get_settings(NvsConfigKey key)

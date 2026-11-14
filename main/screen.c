@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_err.h"
@@ -12,6 +13,10 @@
 #include "display.h"
 #include "connect.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "pool_split.h"
+#include "costean/lode_oled.h"
+#include "costean/costean_core.h"
 
 typedef enum {
     SCR_SELF_TEST,
@@ -23,7 +28,10 @@ typedef enum {
     SCR_BITAXE_LOGO,
     SCR_OSMU_LOGO,
     SCR_URLS,
-    SCR_STATS,
+    SCR_STATS,      /* 128x32: Lode HASH page */
+    SCR_HEAT,       /* 128x32: Lode HEAT page */
+    SCR_SHARES,     /* 128x32: Lode SHARES page */
+    SCR_SPLIT,      /* 128x32: Lode POOLS page */
     SCR_MINING,
     SCR_WIFI,
     MAX_SCREENS,
@@ -46,6 +54,7 @@ extern const lv_font_t ui_font_DigitalNumbers28;
 extern const lv_font_t ui_font_OpenSansBold13;
 extern const lv_font_t ui_font_OpenSansBold14;
 extern const lv_font_t ui_font_AngelWish40;
+extern const lv_font_t lv_font_portfolio_6x8;
 
 static lv_img_dsc_t bitaxe_logo_inverted;
 static lv_img_dsc_t osmu_logo_inverted;
@@ -54,7 +63,7 @@ static uint8_t osmu_logo_inverted_map[OSMU_LOGO_INVERTED_SIZE];
 static bool inverted_logos_ready;
 
 static lv_obj_t * screens[MAX_SCREENS];
-static int delays_ms[MAX_SCREENS] = {0, 0, 0, 0, 0, 1000, 3000, 3000, 10000, 10000, 10000, 10000};
+static int delays_ms[MAX_SCREENS] = {0, 0, 0, 0, 0, 1000, 3000, 3000, 10000, 10000, 8000, 8000, 8000, 10000, 10000};
 
 static int current_screen_time_ms;
 static int current_screen_delay_ms;
@@ -98,6 +107,7 @@ static lv_obj_t *stats_uptime_label;
 static lv_obj_t *stats_ip_label;
 static lv_obj_t *stats_logo_label;
 
+
 static lv_obj_t *wifi_rssi_value_label;
 static lv_obj_t *wifi_signal_strength_label;
 static lv_obj_t *wifi_uptime_label;
@@ -117,13 +127,13 @@ static uint32_t current_uptime_seconds;
 
 static const char *notifications[] = {
     "",     // 0b000: NONE
-    "↑",    // 0b001:                   ACCEPTED
+    "^",    // 0b001:                   ACCEPTED
     "x",    // 0b010:          REJECTED
-    "x↑",   // 0b011:          REJECTED ACCEPTED
-    "↓",    // 0b100: RECEIVED
-    "↕",    // 0b101: RECEIVED          ACCEPTED
-    "x↓",   // 0b110: RECEIVED REJECTED 
-    "x↕"    // 0b111: RECEIVED REJECTED ACCEPTED
+    "x^",   // 0b011:          REJECTED ACCEPTED
+    "v",    // 0b100: RECEIVED
+    "^v",   // 0b101: RECEIVED          ACCEPTED
+    "xv",   // 0b110: RECEIVED REJECTED
+    "x^v"   // 0b111: RECEIVED REJECTED ACCEPTED
 };
 
 static uint64_t current_shares_accepted;
@@ -177,6 +187,133 @@ static lv_obj_t * create_positioned_label(
     lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
     lv_obj_set_style_text_line_space(label, 0, LV_PART_MAIN);
     return label;
+}
+
+
+#define OLED_W 128
+#define OLED_LINE_H 8
+
+static lv_obj_t * create_oled_line(lv_obj_t * parent, int row, const char * text)
+{
+    return create_positioned_label(parent, 0, row * OLED_LINE_H, OLED_W, OLED_LINE_H, &lv_font_portfolio_6x8, text, LV_TEXT_ALIGN_LEFT);
+}
+
+static lv_obj_t * create_bare_screen(void)
+{
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(scr, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    return scr;
+}
+
+/* ---- Costean OS "Lode" screens for the 128x32 OLED ----
+ * Each Lode screen is one 128x32 RGB565 image drawn by the host-tested renderer in
+ * costean/lode_oled.c (white = lit pixel, like the stock logos). */
+typedef struct {
+    lv_obj_t *img;
+    lv_img_dsc_t dsc;
+    uint16_t *buf;
+    lode_fb_t last;
+    bool drawn;
+} lode_slot_t;
+
+static lode_slot_t lode_slots[MAX_SCREENS];
+static lode_view_t lode_view;
+static uint8_t lode_contrast_mode = 0xff;
+
+static lv_obj_t * create_lode_screen(screen_t id)
+{
+    lode_slot_t *ls = &lode_slots[id];
+    lv_obj_t * scr = create_bare_screen();
+    size_t bytes = LODE_W * LODE_H * 2;
+    ls->buf = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ls->buf) ls->buf = heap_caps_calloc(1, bytes, MALLOC_CAP_8BIT);
+    if (!ls->buf) return scr;
+    ls->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    ls->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    ls->dsc.header.w = LODE_W;
+    ls->dsc.header.h = LODE_H;
+    ls->dsc.header.stride = LODE_W * 2;
+    ls->dsc.data_size = bytes;
+    ls->dsc.data = (const uint8_t *) ls->buf;
+    ls->img = lv_img_create(scr);
+    lv_img_set_src(ls->img, &ls->dsc);
+    lv_obj_align(ls->img, LV_ALIGN_TOP_LEFT, 0, 0);
+    return scr;
+}
+
+static void lode_draw(screen_t id, lode_screen_t page, bool blink)
+{
+    lode_slot_t *ls = &lode_slots[id];
+    if (!ls->buf || !ls->img) return;
+    lode_fb_t fb;
+    lode_render(&fb, page, &lode_view, blink);
+    if (ls->drawn && memcmp(&fb, &ls->last, sizeof fb) == 0) return;
+    for (int y = 0; y < LODE_H; y++)
+        for (int x = 0; x < LODE_W; x++)
+            ls->buf[y * LODE_W + x] = lode_get(&fb, x, y) ? 0xFFFF : 0x0000;
+    ls->last = fb;
+    ls->drawn = true;
+    lv_image_cache_drop(&ls->dsc);
+    lv_obj_invalidate(ls->img);
+}
+
+static void lode_fill_view(SystemModule * module, PowerManagementModule * pm)
+{
+    lode_view_t *v = &lode_view;
+    costean_screen_info_t ci;
+    costean_screen_info(&ci);
+    memset(v, 0, sizeof(*v));
+    v->version = "1.2";
+    v->board = GLOBAL_STATE->DEVICE_CONFIG.board_version;
+    snprintf(v->profile, sizeof(v->profile), "%s", ci.profile);
+    v->throttled = ci.throttled;
+    v->scheduled = ci.scheduled;
+    v->tune_steps = ci.tune_steps;
+    v->lim_chip = ci.lim_chip; v->lim_vr = ci.lim_vr; v->lim_power = ci.lim_power;
+    v->ghs = module->current_hashrate;
+    v->mhz = (int) (pm->frequency_value + 0.5f);
+    v->mv = (int) (pm->core_voltage > 0 ? pm->core_voltage + 0.5f : 0);
+    v->chip_c = pm->chip_temp2_avg > pm->chip_temp_avg ? pm->chip_temp2_avg : pm->chip_temp_avg;
+    v->vr_c = pm->vr_temp;
+    v->power_w = pm->power;
+    v->fan_pct = pm->fan_perc;
+    snprintf(v->best_session, sizeof(v->best_session), "%s", module->best_session_diff_string);
+    snprintf(v->best_all, sizeof(v->best_all), "%s", module->best_diff_string);
+    v->acc = (uint32_t) module->shares_accepted;
+    v->rej = (uint32_t) module->shares_rejected;
+    snprintf(v->ip, sizeof(v->ip), "%s", module->ip_addr_str);
+    v->uptime_s = (uint32_t) ((esp_timer_get_time() - module->start_time_us) / 1000000);
+    if (pool_split_is_active()) {
+        int n = pool_split_participant_count();
+        if (n > LODE_MAX_POOLS) n = LODE_MAX_POOLS;
+        v->npools = n;
+        v->split = true;
+        v->failover = pool_split_failover_active();
+        for (int i = 0; i < n; i++) {
+            CosteanPoolRuntime *rt = pool_split_get(i);
+            pool_split_stats_t st;
+            pool_split_stats(i, &st);
+            if (!rt) continue;
+            lode_pool_t *p = &v->pool[i];
+            const char *url = module->pools[rt->pool_index].url;
+            snprintf(p->host, sizeof(p->host), "%s", url ? url : "");
+            p->weight = (uint8_t) st.weight;
+            p->eff = (uint8_t) st.effective;
+            p->up = st.healthy;
+            p->acc = (uint32_t) rt->shares_accepted;
+            p->rej = (uint32_t) rt->shares_rejected;
+        }
+    } else {
+        uint16_t idx = module->is_using_fallback ? module->secondary_pool_index : module->primary_pool_index;
+        const char *url = idx < MAX_POOLS ? module->pools[idx].url : NULL;
+        v->npools = 1;
+        snprintf(v->pool[0].host, sizeof(v->pool[0].host), "%s", url ? url : "");
+        v->pool[0].up = !module->pools_unavailable;
+        v->pool[0].weight = v->pool[0].eff = 100;
+        v->failover = module->is_using_fallback;
+    }
 }
 
 static void format_compact_uptime(char * buf, size_t buf_size, int64_t start_time_us)
@@ -264,7 +401,7 @@ static lv_obj_t * create_scr_self_test() {
     lv_obj_t * scr = create_flex_screen(4);
 
     lv_obj_t *label1 = lv_label_create(scr);
-    lv_label_set_text(label1, "BITAXE SELF-TEST");
+    lv_label_set_text(label1, "COSTEAN SELF-TEST");
 
     self_test_message_label = lv_label_create(scr);
     self_test_result_label = lv_label_create(scr);
@@ -274,6 +411,10 @@ static lv_obj_t * create_scr_self_test() {
 }
 
 static lv_obj_t * create_scr_overheat() {
+    if (!is_large_display()) {
+        return create_lode_screen(SCR_OVERHEAT);
+    }
+
     lv_obj_t * scr = create_flex_screen(4);
 
     lv_obj_t *label1 = lv_label_create(scr);
@@ -282,7 +423,7 @@ static lv_obj_t * create_scr_overheat() {
     lv_obj_t *label2 = lv_label_create(scr);
     lv_obj_set_width(label2, LV_HOR_RES);
     lv_label_set_long_mode(label2, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_label_set_text(label2, "Power, frequency and fan configurations have been reset. Go to AxeOS to reconfigure device.");
+    lv_label_set_text(label2, "Power, frequency and fan were reset. Open Costean OS in a browser to reconfigure.");
 
     lv_obj_t *label3 = lv_label_create(scr);
     lv_label_set_text(label3, "IP Address:");
@@ -343,7 +484,7 @@ static lv_obj_t * create_scr_welcome(const char * ap_ssid) {
     lv_obj_set_width(label1, lv_pct(100));
     lv_obj_set_style_anim_duration(label1, 15000, LV_PART_MAIN);
     lv_label_set_long_mode(label1, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_label_set_text(label1, "Welcome to your new Bitaxe! Connect to the configuration Wi-Fi and connect the Bitaxe to your network.");
+    lv_label_set_text(label1, "Welcome to Costean OS. Connect to the setup Wi-Fi and join your network.");
 
     // add a bit of padding, it looks nicer this way
     lv_obj_set_style_pad_bottom(label1, 4, LV_PART_MAIN);
@@ -394,26 +535,28 @@ static lv_obj_t * create_scr_connection(const char * ssid, const char * ap_ssid)
 }
 
 static lv_obj_t * create_scr_bitaxe_logo(const char * name, const char * board_version) {
+    if (!is_large_display()) {
+        lv_obj_t * scr = create_lode_screen(SCR_BITAXE_LOGO);
+        lode_view.version = "1.2";
+        lode_view.board = board_version;
+        lode_draw(SCR_BITAXE_LOGO, LODE_SPLASH, false);
+        return scr;
+    }
+
     lv_obj_t * scr = lv_obj_create(NULL);
     apply_screen_padding(scr);
 
-    if (is_large_display()) {
-        lv_obj_t *img = lv_img_create(scr);
-        lv_img_set_src(img, &bitaxe_logo_large);
-        lv_obj_align(img, LV_ALIGN_CENTER, -42, -8);
-    } else {
-        lv_obj_t *img = lv_img_create(scr);
-        lv_img_set_src(img, get_bitaxe_logo_src());
-        lv_obj_align(img, LV_ALIGN_CENTER, 0, 1);
-    }
+    lv_obj_t *img = lv_img_create(scr);
+    lv_img_set_src(img, &bitaxe_logo_large);
+    lv_obj_align(img, LV_ALIGN_CENTER, -42, -8);
 
     lv_obj_t *label1 = lv_label_create(scr);
     lv_label_set_text(label1, name);
-    lv_obj_align(label1, LV_ALIGN_RIGHT_MID, -8, is_large_display() ? -18 : -12);
+    lv_obj_align(label1, LV_ALIGN_RIGHT_MID, -8, -18);
 
     lv_obj_t *label2 = lv_label_create(scr);
     lv_label_set_text(label2, board_version);
-    lv_obj_align(label2, LV_ALIGN_RIGHT_MID, -8, is_large_display() ? 2 : -4);
+    lv_obj_align(label2, LV_ALIGN_RIGHT_MID, -8, 2);
 
     return scr;
 }
@@ -475,24 +618,20 @@ static lv_obj_t * create_scr_stats() {
         return scr;
     }
 
-    lv_obj_t * scr = create_flex_screen(4);
-
-    stats_hashrate_label = lv_label_create(scr);
-    lv_label_set_text(stats_hashrate_label, "Gh/s: --");
-
-    stats_efficiency_label = lv_label_create(scr);
-    lv_label_set_text(stats_efficiency_label, "J/Th: --");
-
-    stats_difficulty_label = lv_label_create(scr);
-    lv_label_set_text(stats_difficulty_label, "Best: --");
-
-    stats_temp_label = lv_label_create(scr);
-    lv_label_set_text(stats_temp_label, "Temp: --");
-
-    return scr;
+    return create_lode_screen(SCR_STATS);
 }
 
 static lv_obj_t * create_scr_mining() {
+    if (!is_large_display()) {
+        lv_obj_t * scr = create_bare_screen();
+        mining_block_height_label = create_oled_line(scr, 0, "Blk --");
+        mining_network_difficulty_label = create_oled_line(scr, 1, "Diff --");
+        mining_scriptsig_title_label = create_oled_line(scr, 2, "Sig");
+        mining_scriptsig_label = create_oled_line(scr, 3, "--");
+        lv_label_set_long_mode(mining_scriptsig_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        return scr;
+    }
+
     lv_obj_t * scr = create_flex_screen(4);
 
     mining_block_height_label = lv_label_create(scr);
@@ -510,6 +649,13 @@ static lv_obj_t * create_scr_mining() {
     lv_label_set_long_mode(mining_scriptsig_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
 
     return scr;
+}
+
+static lv_obj_t * create_scr_lode_page(screen_t id) {
+    if (is_large_display()) {
+        return NULL;   /* the Lode pages are for the 128x32 OLED */
+    }
+    return create_lode_screen(id);
 }
 
 static lv_obj_t * create_scr_wifi() {
@@ -663,6 +809,15 @@ void screen_next()
             next_scr = SCR_CAROUSEL_START;
         }
 
+        /* 128x32: Lode HASH -> HEAT -> SHARES -> POOLS -> block/scriptsig. The URL, IP and Wi-Fi
+         * facts live on the SHARES and POOLS pages, so those text pages are skipped. */
+        if (!is_large_display() && (next_scr == SCR_URLS || next_scr == SCR_WIFI)) {
+            continue;
+        }
+        if (is_large_display() && (next_scr == SCR_HEAT || next_scr == SCR_SHARES || next_scr == SCR_SPLIT)) {
+            continue;
+        }
+
     } while (!screen_show(next_scr));
 }
 
@@ -696,6 +851,19 @@ static void screen_update_cb(lv_timer_t * timer)
         if (inactive_time < display_timeout || current_screen < SCR_CAROUSEL_START || is_identify_mode) {
             enable_display = true;
         }
+    }
+
+    /* Costean schedules: "off" blanks the carousel (a button press wakes it for 30 s,
+     * alerts and setup screens still show); "dim" lowers the OLED contrast. */
+    uint8_t sched_mode = costean_screen_mode();
+    if (sched_mode == 2 && current_screen >= SCR_CAROUSEL_START && inactive_time >= 30000 && !is_identify_mode
+        && !module->show_new_block && !module->overheat_mode) {
+        enable_display = false;
+    }
+    uint8_t contrast_mode = sched_mode == 1 ? 1 : 0;
+    if (!is_large_display() && contrast_mode != lode_contrast_mode) {
+        display_set_contrast(contrast_mode ? 0x06 : 0x7F);
+        lode_contrast_mode = contrast_mode;
     }
 
     display_on(enable_display);
@@ -740,7 +908,10 @@ static void screen_update_cb(lv_timer_t * timer)
     }
 
     if (module->overheat_mode) {
-        if (strcmp(module->ip_addr_str, lv_label_get_text(overheat_ip_addr_label)) != 0) {
+        if (!is_large_display()) {
+            snprintf(lode_view.ip, sizeof(lode_view.ip), "%s", module->ip_addr_str);
+            lode_draw(SCR_OVERHEAT, LODE_OVERHEAT, (esp_timer_get_time() / 1000000) & 1);
+        } else if (strcmp(module->ip_addr_str, lv_label_get_text(overheat_ip_addr_label)) != 0) {
             lv_label_set_text(overheat_ip_addr_label, module->ip_addr_str);
         }
 
@@ -787,46 +958,25 @@ static void screen_update_cb(lv_timer_t * timer)
         lv_label_set_text(urls_ip_addr_label, module->ip_addr_str);
     }
 
-    if (current_hashrate != module->current_hashrate) {
-        lv_label_set_text_fmt(stats_hashrate_label, "Gh/s: %.0f", module->current_hashrate);
-    }
-
-    if (current_power != power_management->power || current_hashrate != module->current_hashrate) {
-        if (power_management->power > 0 && module->current_hashrate > 0) {
-            float efficiency = power_management->power / (module->current_hashrate / 1000.0);
-            lv_label_set_text_fmt(stats_efficiency_label, "J/Th: %.2f", efficiency);
-        }
-        current_power = power_management->power;
-    }
-    current_hashrate = module->current_hashrate;
-
-    if (current_difficulty != module->best_session_nonce_diff) {
-        if (module->show_new_block) {
-            lv_obj_set_width(stats_difficulty_label, LV_HOR_RES);
-            lv_label_set_long_mode(stats_difficulty_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-            lv_label_set_text_fmt(stats_difficulty_label, "Best: %s   !!! BLOCK FOUND !!!", module->best_session_diff_string);
-        } else {
-            lv_label_set_text_fmt(stats_difficulty_label, "Best: %s/%s", module->best_session_diff_string, module->best_diff_string);
-        }
-        current_difficulty = module->best_session_nonce_diff;
-    }
-
-    if (current_chip_temp != power_management->chip_temp_avg) {
-        if (power_management->chip_temp_avg > 0) {
-            if (power_management->chip_temp2_avg > 0) {
-                lv_label_set_text_fmt(stats_temp_label, "Temp: %.1f°C/%.1f°C", power_management->chip_temp_avg, power_management->chip_temp2_avg);
-            } else {
-                lv_label_set_text_fmt(stats_temp_label, "Temp: %.1f°C", power_management->chip_temp_avg);
-            }
-        }
-        current_chip_temp = power_management->chip_temp_avg;
+    if (!is_large_display()) {
+        bool blink = (esp_timer_get_time() / 1000000) & 1;
+        lode_fill_view(module, power_management);
+        /* every page is redrawn (cheap, and unchanged frames are skipped) so a page sliding
+         * in during the carousel animation already shows fresh numbers */
+        lode_draw(SCR_STATS, module->show_new_block ? LODE_BLOCK : LODE_HASH, blink);
+        lode_draw(SCR_HEAT, LODE_HEAT, blink);
+        lode_draw(SCR_SHARES, LODE_SHARES, blink);
+        lode_draw(SCR_SPLIT, LODE_POOLS, blink);
     }
 
     update_stats_background_labels(module, power_management);
 
     if (GLOBAL_STATE->stratum_protocol == STRATUM_PROTOCOL_V2) {
         // SV2 standard channel: no coinbase data, so no block height or scriptsig
-        lv_label_set_text(mining_block_height_label, "Protocol: SV2");
+        lv_label_set_text(mining_block_height_label, is_large_display() ? "Protocol: SV2" : "Protocol SV2");
+            if (!is_large_display()) {
+                lv_label_set_text(mining_network_difficulty_label, "");
+            }
         lv_obj_add_flag(mining_scriptsig_title_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(mining_scriptsig_label, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -834,7 +984,7 @@ static void screen_update_cb(lv_timer_t * timer)
         lv_obj_clear_flag(mining_scriptsig_label, LV_OBJ_FLAG_HIDDEN);
 
         if (current_block_height != GLOBAL_STATE->block_height) {
-            lv_label_set_text_fmt(mining_block_height_label, "Block: %d", GLOBAL_STATE->block_height);
+            lv_label_set_text_fmt(mining_block_height_label, is_large_display() ? "Block: %d" : "Blk %d", GLOBAL_STATE->block_height);
             current_block_height = GLOBAL_STATE->block_height;
         }
 
@@ -843,8 +993,13 @@ static void screen_update_cb(lv_timer_t * timer)
         }
     }
 
-    if (strcmp(&lv_label_get_text(mining_network_difficulty_label)[9], GLOBAL_STATE->network_diff_string) != 0) {
-        lv_label_set_text_fmt(mining_network_difficulty_label, "Difficulty: %s", GLOBAL_STATE->network_diff_string);
+    {
+        const char *want_fmt = is_large_display() ? "Difficulty: %s" : "Diff %s";
+        char want[32];
+        snprintf(want, sizeof(want), want_fmt, GLOBAL_STATE->network_diff_string);
+        if (strcmp(lv_label_get_text(mining_network_difficulty_label), want) != 0) {
+            lv_label_set_text(mining_network_difficulty_label, want);
+        }
     }
 
     // Update WiFi RSSI periodically
@@ -971,14 +1126,21 @@ esp_err_t screen_start(GlobalState * global_state)
             screens[SCR_WELCOME] = create_scr_welcome(SYSTEM_MODULE->ap_ssid);
             screens[SCR_FIRMWARE] = create_scr_firmware();
             screens[SCR_CONNECTION] = create_scr_connection(SYSTEM_MODULE->ssid, SYSTEM_MODULE->ap_ssid);
-            screens[SCR_BITAXE_LOGO] = create_scr_bitaxe_logo(GLOBAL_STATE->DEVICE_CONFIG.family.name, GLOBAL_STATE->DEVICE_CONFIG.board_version);
+            screens[SCR_BITAXE_LOGO] = create_scr_bitaxe_logo("Costean", GLOBAL_STATE->DEVICE_CONFIG.board_version);
             screens[SCR_OSMU_LOGO] = create_scr_osmu_logo();
             screens[SCR_URLS] = create_scr_urls();
             screens[SCR_STATS] = create_scr_stats();
+            screens[SCR_HEAT] = create_scr_lode_page(SCR_HEAT);
+            screens[SCR_SHARES] = create_scr_lode_page(SCR_SHARES);
+            screens[SCR_SPLIT] = create_scr_lode_page(SCR_SPLIT);
             screens[SCR_MINING] = create_scr_mining();
             screens[SCR_WIFI] = create_scr_wifi();
 
             scr_create_overlay();
+            if (!is_large_display()) {
+                /* the Lode header carries the status; the share arrows would cover the profile tag */
+                lv_obj_add_flag(notification_label, LV_OBJ_FLAG_HIDDEN);
+            }
 
             lv_timer_create(screen_update_cb, SCREEN_UPDATE_MS, NULL);
 

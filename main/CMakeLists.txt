@@ -43,6 +43,20 @@ SRCS
     "./tasks/protocol_coordinator.c"
     "./tasks/create_jobs_task.c"
     "./tasks/asic_result_task.c"
+    "pool_split_core.c"
+    "pool_split.c"
+    "./tasks/stratum_split_task.c"
+    "discord_alerts.c"
+    "./costean/tuning.cpp"
+    "./costean/scheduler.cpp"
+    "./costean/rollup.cpp"
+    "./costean/poolsplit.cpp"
+    "./costean/board602.cpp"
+    "./costean/costean_split.cpp"
+    "./costean/costean_core.cpp"
+    "./costean/costean_hw.c"
+    "./costean/lode_oled.c"
+    "./costean/lode_font.c"
     "./tasks/power_management_task.c"
     "./tasks/statistics_task.c"
     "./tasks/scoreboard.c"
@@ -87,6 +101,8 @@ PRIV_REQUIRES
     "esp_app_format"
     "esp_driver_gpio"
     "esp_event"
+    "esp_http_client"
+    "esp-tls"
     "esp_http_server"
     "esp_lcd"
     "esp_netif"
@@ -108,18 +124,20 @@ EMBED_FILES "http_server/recovery_page.html"
 idf_build_set_property(COMPILE_OPTIONS "-DLV_CONF_INCLUDE_SIMPLE=1" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-DLV_CONF_PATH=\"${CMAKE_SOURCE_DIR}/main/lv_conf.h\"" APPEND)
 
-set(WEB_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/http_server/axe-os")
+set(WEB_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/http_server/costean-ui")
 
 if("$ENV{GITHUB_ACTIONS}" STREQUAL "true")
     message(STATUS "Running on GitHub Actions. Web ui will be prebuilt.")
 
+    # Re-embed whenever any prebuilt web UI file changes, not only the script.
+    file(GLOB_RECURSE WEB_DIST_FILES CONFIGURE_DEPENDS "${WEB_SRC_DIR}/dist/axe-os/*")
     add_custom_command(
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c" "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.h"
         COMMAND ${PYTHON} "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py"
                 "${WEB_SRC_DIR}/dist/axe-os"
                 "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.c"
                 "${CMAKE_CURRENT_BINARY_DIR}/embedded_web_ui.h"
-        DEPENDS "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py"
+        DEPENDS "${CMAKE_SOURCE_DIR}/tools/embed_web_ui.py" ${WEB_DIST_FILES}
         COMMENT "Generating embedded Web UI source files (CI)"
         VERBATIM
     )
@@ -142,7 +160,6 @@ else()
     add_custom_command(
         OUTPUT ${OPENAPI_STAMP}
         COMMAND ${NPM_EXECUTABLE} i
-        COMMAND ${NPM_EXECUTABLE} run generate:api
         COMMAND ${CMAKE_COMMAND} -E touch ${OPENAPI_STAMP}
         WORKING_DIRECTORY ${WEB_SRC_DIR}
         DEPENDS ${OPENAPI_SPEC}
@@ -160,10 +177,8 @@ else()
     # Also track build configuration files
     list(APPEND WEB_UI_SOURCES
         "${WEB_SRC_DIR}/package.json"
-        "${WEB_SRC_DIR}/package-lock.json"
-        "${WEB_SRC_DIR}/angular.json"
-        "${WEB_SRC_DIR}/tsconfig.json"
-        "${WEB_SRC_DIR}/tsconfig.app.json"
+        "${WEB_SRC_DIR}/vite.config.js"
+        "${WEB_SRC_DIR}/index.html"
     )
 
     # Use a stamp file to track when the build was last done
@@ -175,7 +190,7 @@ else()
     add_custom_command(
         OUTPUT ${WEB_UI_STAMP} ${WEB_UI_OUTPUT}
         COMMAND ${NPM_EXECUTABLE} i
-        COMMAND ${NPM_EXECUTABLE} run build:no-api-gen
+        COMMAND ${NPM_EXECUTABLE} run build
         COMMAND ${CMAKE_COMMAND} -E touch ${WEB_UI_STAMP}
         WORKING_DIRECTORY ${WEB_SRC_DIR}
         DEPENDS ${WEB_UI_SOURCES} ${OPENAPI_STAMP}

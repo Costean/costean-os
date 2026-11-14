@@ -72,6 +72,7 @@ void construct_bm_job(mining_notify *params, const uint8_t merkle_root[32], cons
     new_job->ntime = params->ntime;
     new_job->starting_nonce = 0;
     new_job->pool_diff = difficulty;
+    new_job->pool_index = -1;
     reverse_32bit_words(merkle_root, new_job->merkle_root);
 
     uint8_t prev_block_hash[32];

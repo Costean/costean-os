@@ -44,6 +44,7 @@ static const char * TAG = "display";
 static const char * LVGL_TAG = "lvgl";
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
+static esp_lcd_panel_io_handle_t oled_io_handle = NULL;
 static const I80Pins *current_st7789_pins = NULL;
 static bool display_state_on = false;
 static bool display_has_backlight = false;
@@ -300,6 +301,7 @@ esp_err_t display_init(GlobalState * GLOBAL_STATE)
     
     esp_lcd_panel_io_handle_t io_handle = NULL;
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i2c(i2c_master_bus_handle, &io_config, &io_handle), TAG, "Failed to initialise i2c panel bus");
+    oled_io_handle = io_handle;
 
     ESP_LOGI(TAG, "Install panel driver");
     esp_lcd_panel_dev_config_t panel_config = {
@@ -417,6 +419,15 @@ esp_err_t display_init(GlobalState * GLOBAL_STATE)
     ESP_LOGI(TAG, "Display init success!");
 
     return ESP_OK;
+}
+
+/* Costean OS: OLED brightness for scheduled "dim" windows (SSD1306/SH1107 contrast, 0x81). */
+esp_err_t display_set_contrast(uint8_t level)
+{
+    if (oled_io_handle == NULL || panel_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_lcd_panel_io_tx_param(oled_io_handle, 0x81, (uint8_t[]) { level }, 1);
 }
 
 esp_err_t display_on(bool display_on)

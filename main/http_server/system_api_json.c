@@ -11,6 +11,8 @@
 #include "system_api_json.h"
 #include "system.h"
 #include "nvs_config.h"
+#include "pool_split.h"
+#include "discord_alerts.h"
 #include "sv2_protocol.h"
 #include "vcore.h"
 #include "connect.h"
@@ -167,6 +169,53 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
     cJSON_AddNumberToObject(root, "secondaryPoolIndex", sec_idx);
     cJSON_AddNumberToObject(root, "useFallbackStratum", g->SYSTEM_MODULE.use_fallback_stratum ? 1 : 0);
 
+    cJSON_AddNumberToObject(root, "poolSplitEnabled", nvs_config_get_bool(NVS_CONFIG_POOL_SPLIT_ENABLED) ? 1 : 0);
+    cJSON_AddNumberToObject(root, "poolSplitActive", pool_split_is_active() ? 1 : 0);
+    cJSON_AddStringToObject(root, "poolSplitError", pool_split_error_string(pool_split_current_error()));
+    cJSON_AddNumberToObject(root, "poolSplitFailover", pool_split_failover_active() ? 1 : 0);
+    cJSON_AddNumberToObject(root, "poolSplitRestartNeeded", pool_split_restart_needed() ? 1 : 0);
+    cJSON *split_stats = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "poolSplitStats", split_stats);
+    for (int i = 0; i < pool_split_participant_count(); i++) {
+        CosteanPoolRuntime *rt = pool_split_get(i);
+        if (!rt) continue;
+        cJSON *s = cJSON_CreateObject();
+        cJSON_AddNumberToObject(s, "id", rt->pool_index);
+        cJSON_AddNumberToObject(s, "configuredPercent", rt->configured_percent);
+        cJSON_AddNumberToObject(s, "effectivePercent", rt->effective_percent);
+        cJSON_AddBoolToObject(s, "connected", rt->connected);
+        cJSON_AddBoolToObject(s, "ready", rt->ready);
+        cJSON_AddNumberToObject(s, "jobsSent", (double)rt->jobs_sent);
+        cJSON_AddNumberToObject(s, "workReceived", (double)rt->work_received);
+        cJSON_AddNumberToObject(s, "sharesAccepted", (double)rt->shares_accepted);
+        cJSON_AddNumberToObject(s, "sharesRejected", (double)rt->shares_rejected);
+        cJSON_AddNumberToObject(s, "difficulty", rt->difficulty);
+        const char *url = g->SYSTEM_MODULE.pools[rt->pool_index].url;
+        cJSON_AddStringToObject(s, "stratumURL", url ? url : "");
+        pool_split_stats_t st;
+        pool_split_stats(i, &st);
+        cJSON_AddBoolToObject(s, "healthy", st.healthy);
+        cJSON_AddBoolToObject(s, "backup", st.backup);
+        cJSON_AddNumberToObject(s, "jobShare", st.job_share);
+        cJSON_AddNumberToObject(s, "creditedGhs", st.credited_ghs);
+        cJSON_AddItemToArray(split_stats, s);
+    }
+
+    cJSON_AddNumberToObject(root, "discordEnabled", nvs_config_get_bool(NVS_CONFIG_DISCORD_ENABLED) ? 1 : 0);
+    cJSON_AddNumberToObject(root, "discordConfigured", discord_webhook_is_configured() ? 1 : 0);
+    char preview[160] = {0};
+    char *hook = nvs_config_get_string(NVS_CONFIG_DISCORD_WEBHOOK);
+    discord_webhook_preview(hook, preview, sizeof(preview));
+    if (hook) { memset(hook, 0, strlen(hook)); free(hook); }
+    cJSON_AddStringToObject(root, "discordWebhookPreview", preview);
+    cJSON_AddNumberToObject(root, "discordBlockFound", nvs_config_get_bool(NVS_CONFIG_DISCORD_BLOCK_FOUND) ? 1 : 0);
+    cJSON_AddNumberToObject(root, "discordBestDiff", nvs_config_get_bool(NVS_CONFIG_DISCORD_BEST_DIFF) ? 1 : 0);
+    cJSON_AddNumberToObject(root, "discordOffline", nvs_config_get_bool(NVS_CONFIG_DISCORD_OFFLINE) ? 1 : 0);
+    cJSON_AddNumberToObject(root, "discordOverheat", nvs_config_get_bool(NVS_CONFIG_DISCORD_OVERHEAT) ? 1 : 0);
+    cJSON_AddNumberToObject(root, "discordStatusMinutes", nvs_config_get_u16(NVS_CONFIG_DISCORD_STATUS_MINUTES));
+
+    cJSON_AddStringToObject(root, "firmwareName", "Costean OS");
+
     cJSON *pools_arr = cJSON_CreateArray();
     cJSON_AddItemToObject(root, "pools", pools_arr);
     for (int i = 0; i < MAX_POOLS; i++) {
@@ -187,6 +236,7 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
             cJSON_AddStringToObject(p_obj, "stratumV2ChannelType", p->sv2_channel_type == SV2_CHANNEL_STANDARD ? SV2_CHANNEL_TYPE_STANDARD : SV2_CHANNEL_TYPE_EXTENDED);
             cJSON_AddStringToObject(p_obj, "stratumV2AuthorityPubkey", p->sv2_authority_pubkey ? p->sv2_authority_pubkey : "");
             cJSON_AddBoolToObject(p_obj, "stratumV2RequireAuth", p->sv2_require_auth);
+            cJSON_AddNumberToObject(p_obj, "splitPercent", p->split_percent);
 
             cJSON_AddItemToArray(pools_arr, p_obj);
         }

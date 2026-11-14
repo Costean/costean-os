@@ -24,6 +24,7 @@
 
 #include "global_state.h"
 #include "system.h"
+#include "discord_alerts.h"
 #include "connect.h"
 #include "nvs_config.h"
 #include "display.h"
@@ -78,6 +79,7 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
     cfg->sv2_channel_type = SV2_CHANNEL_EXTENDED;
     cfg->sv2_authority_pubkey = strdup("");
     cfg->sv2_require_auth = false;
+    cfg->split_percent = 0;
 
     if (!json_str || strlen(json_str) == 0) {
         return;
@@ -160,6 +162,11 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
     item = cJSON_GetObjectItem(root, "stratumV2RequireAuth");
     if (item && (cJSON_IsBool(item) || cJSON_IsNumber(item))) {
         cfg->sv2_require_auth = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint != 0);
+    }
+
+    item = cJSON_GetObjectItem(root, "splitPercent");
+    if (item && cJSON_IsNumber(item) && item->valueint >= 0 && item->valueint <= 100) {
+        cfg->split_percent = (uint16_t)item->valueint;
     }
 
     cJSON_Delete(root);
@@ -508,6 +515,7 @@ void SYSTEM_notify_found_nonce(GlobalState * GLOBAL_STATE, double diff, uint32_t
         module->block_found++;
         module->show_new_block = true;
         ESP_LOGI(TAG, "FOUND BLOCK!!!!!!!!!!!!!!!!!!!!!! %f >= %f (count: %d)", diff, network_diff, module->block_found);
+        discord_alerts_notify_block_found(diff, network_diff);
     }
 
     if ((uint64_t) diff <= module->best_nonce_diff) {
@@ -521,6 +529,7 @@ void SYSTEM_notify_found_nonce(GlobalState * GLOBAL_STATE, double diff, uint32_t
     suffixString((uint64_t) diff, module->best_diff_string, DIFF_STRING_SIZE, 0);
 
     ESP_LOGI(TAG, "New best difficulty: %s", module->best_diff_string);
+    discord_alerts_notify_best_diff(diff, network_diff);
 }
 
 static esp_err_t ensure_overheat_mode_config() {

@@ -39,6 +39,7 @@ static const DisplayConfig display_configs[] = {
 
 esp_err_t display_init(GlobalState * GLOBAL_STATE);
 esp_err_t display_on(bool display_on);
+esp_err_t display_set_contrast(uint8_t level);
 const DisplayConfig * get_display_config(const char * name);
 
 #endif /* DISPLAY_H_ */

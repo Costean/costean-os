@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "global_state.h"
 #include "nvs_config.h"
+#include "costean/costean_core.h"
 #include "vcore.h"
 #include "thermal.h"
 #include "power.h"
@@ -231,6 +232,16 @@ void POWER_MANAGEMENT_task(void * pvParameters)
         float asic_frequency = GLOBAL_STATE->SELF_TEST_MODULE.is_active
                                  ? GLOBAL_STATE-> DEVICE_CONFIG.family.asic.default_frequency_mhz
                                  : nvs_config_get_float(NVS_CONFIG_ASIC_FREQUENCY);
+        // Costean OS: profile / schedule / throttle / auto-tune operating point. Manual (the default)
+        // returns false and the saved values above are used exactly like stock ESP-Miner.
+        if (!GLOBAL_STATE->SELF_TEST_MODULE.is_active && !nvs_config_get_bool(NVS_CONFIG_OVERHEAT_MODE)) {
+            float costean_mhz;
+            uint16_t costean_mv;
+            if (costean_operating_point(&costean_mhz, &costean_mv)) {
+                core_voltage = costean_mv;
+                asic_frequency = costean_mhz;
+            }
+        }
 
         if (core_voltage != last_core_voltage) {
             ESP_LOGI(TAG, "setting new vcore voltage to %umV", core_voltage);

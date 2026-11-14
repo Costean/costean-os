@@ -1,0 +1,20 @@
+{
+  "name": "costean-bitaxe-ui",
+  "private": true,
+  "version": "1.2.0-costean.1",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "description": "Costean OS web UI for the Bitaxe Gamma 602 (ESP-Miner 2.15.4 API)",
+  "scripts": {
+    "build": "node scripts/version.mjs && vite build && node scripts/gzip-dist.mjs",
+    "test": "vitest run",
+    "mock": "node e2e/mock-server.mjs",
+    "shots": "node e2e/shots.mjs"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "svelte": "^5.57.3",
+    "vite": "^8.3.5",
+    "vitest": "^5.1.0"
+  }
+}

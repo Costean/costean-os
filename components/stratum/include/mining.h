@@ -23,6 +23,7 @@ typedef struct bm_job
     double pool_diff;
     char *jobid;
     char *extranonce2;
+    int8_t pool_index; /* -1 when not in multi-pool split mode */
 } bm_job;
 
 void free_bm_job(bm_job *job);

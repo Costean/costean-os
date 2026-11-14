@@ -2,6 +2,7 @@
 #define STRATUM_API_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <sys/time.h>
 #include <esp_transport.h>
@@ -81,9 +82,20 @@ typedef struct RequestTiming
 
 esp_transport_handle_t STRATUM_V1_transport_init(tls_mode tls, char * cert);
 
+typedef struct stratum_recv_buf {
+    char *buf;
+    size_t size;
+} stratum_recv_buf_t;
+
 void STRATUM_V1_initialize_buffer(void);
 
 char *STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport);
+
+/* Reentrant receive for multi-pool split: leftover bytes stay in *rb. */
+int STRATUM_V1_recv_buf_init(stratum_recv_buf_t *rb, size_t size);
+void STRATUM_V1_recv_buf_reset(stratum_recv_buf_t *rb);
+void STRATUM_V1_recv_buf_free(stratum_recv_buf_t *rb);
+char *STRATUM_V1_receive_jsonrpc_line_buf(esp_transport_handle_t transport, stratum_recv_buf_t *rb);
 
 int STRATUM_V1_subscribe(esp_transport_handle_t transport, int send_uid, const char * model);
 
