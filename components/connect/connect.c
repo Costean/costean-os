@@ -23,7 +23,7 @@
 #include "esp_app_desc.h"
 
 // Maximum number of access points to scan
-#define MAX_AP_COUNT 20
+#define MAX_AP_COUNT 32
 
 #if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -65,6 +65,9 @@ static uint16_t ap_number = 0;
 static wifi_ap_record_t ap_info[MAX_AP_COUNT];
 static int s_retry_num = 0;
 static int clients_connected_to_ap = 0;
+// Costean OS: true once a station SSID is saved. With no SSID (fresh flash) the STA side only scans, it never
+// tries to join, so setup scans are not interrupted by connect/retry cycles.
+static bool sta_configured = false;
 static bool mdns_initialized = false;
 static bool mdns_init_in_progress = false;
 
@@ -315,9 +318,12 @@ esp_err_t get_wifi_current_rssi(int8_t *rssi)
     return err;
 }
 
-// Function to scan for available WiFi networks
+// Function to scan for available WiFi networks.
+// Costean OS: runs while the setup hotspot stays up (APSTA). Short active dwell per channel and regular trips back to
+// the hotspot channel keep a phone that is connected to the hotspot from dropping off during the scan.
 esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
 {
+    *ap_count = 0;
     if (is_scanning) {
         ESP_LOGW(TAG, "Scan already in progress");
         return ESP_ERR_INVALID_STATE;
@@ -327,52 +333,76 @@ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
     is_scanning = true;
 
     wifi_ap_record_t current_ap_info;
-    if (esp_wifi_sta_get_ap_info(&current_ap_info) != ESP_OK) {
-        ESP_LOGI(TAG, "Forcing disconnect so that we can scan!");
+    bool sta_linked = esp_wifi_sta_get_ap_info(&current_ap_info) == ESP_OK;
+    if (sta_configured && !sta_linked) {
+        // A pending join attempt blocks the scan; stop it, the join is resumed after the scan.
+        ESP_LOGI(TAG, "Pausing Wi-Fi join so that we can scan");
         esp_wifi_disconnect();
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(300 / portTICK_PERIOD_MS);
     }
 
-     wifi_scan_config_t scan_config = {
+    wifi_scan_config_t scan_config = {
         .ssid = 0,
         .bssid = 0,
         .channel = 0,
-        .show_hidden = false
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time = { .active = { .min = 60, .max = 120 } },
+        .home_chan_dwell_time = 60,
     };
 
     esp_err_t err = esp_wifi_scan_start(&scan_config, false);
+    if (err == ESP_ERR_WIFI_STATE) {
+        // Station still busy connecting: give it a moment and try once more.
+        esp_wifi_disconnect();
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        err = esp_wifi_scan_start(&scan_config, false);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi scan start failed with error: %s", esp_err_to_name(err));
         is_scanning = false;
+        if (sta_configured && !sta_linked) esp_wifi_connect();
         return err;
     }
 
-    uint16_t retries_remaining = 10;
-    while (is_scanning) {
-        retries_remaining--;
-        if (retries_remaining == 0) {
-            is_scanning = false;
-            return ESP_FAIL;
-        }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // 13 channels x (120 ms + 60 ms home dwell) is about 2.5 s; allow 8 s before giving up.
+    int waited_ms = 0;
+    while (is_scanning && waited_ms < 8000) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        waited_ms += 100;
+    }
+    if (is_scanning) {
+        ESP_LOGW(TAG, "Wi-Fi scan timed out");
+        esp_wifi_scan_stop();
+        is_scanning = false;
+        if (sta_configured && !sta_linked) esp_wifi_connect();
+        return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGD(TAG, "Wi-Fi networks found: %d", ap_number);
-    if (ap_number == 0) {
-        ESP_LOGW(TAG, "No Wi-Fi networks found");
-    }
-
-    *ap_count = ap_number;
-    memset(ap_records, 0, (*ap_count) * sizeof(wifi_ap_record_simple_t));
-    for (int i = 0; i < ap_number; i++) {
+    ESP_LOGI(TAG, "Wi-Fi networks found: %d (%d ms)", ap_number, waited_ms);
+    uint16_t n = ap_number > MAX_AP_COUNT ? MAX_AP_COUNT : ap_number;
+    *ap_count = n;
+    memset(ap_records, 0, n * sizeof(wifi_ap_record_simple_t));
+    for (int i = 0; i < n; i++) {
         memcpy(ap_records[i].ssid, ap_info[i].ssid, sizeof(ap_records[i].ssid));
+        ap_records[i].ssid[sizeof(ap_records[i].ssid) - 1] = '\0';
         ap_records[i].rssi = ap_info[i].rssi;
         ap_records[i].authmode = ap_info[i].authmode;
     }
 
-    ESP_LOGD(TAG, "Finished Wi-Fi scan!");
+    // Disconnect events were ignored while scanning, so resume the join here.
+    if (sta_configured && !sta_linked && !wifi_is_connected()) {
+        ESP_LOGI(TAG, "Resuming Wi-Fi join after scan");
+        esp_wifi_connect();
+    }
 
+    ESP_LOGD(TAG, "Finished Wi-Fi scan!");
     return ESP_OK;
+}
+
+uint16_t wifi_scan_max_records(void)
+{
+    return MAX_AP_COUNT;
 }
 
 static void ip_timeout_callback(TimerHandle_t xTimer)
@@ -393,10 +423,29 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         if (event_id == WIFI_EVENT_SCAN_DONE) {
             esp_wifi_scan_get_ap_num(&ap_number);
             ESP_LOGI(TAG, "Wi-Fi Scan Done");
+            // Never ask for more records than ap_info can hold (busy areas can report more).
+            if (ap_number > MAX_AP_COUNT) ap_number = MAX_AP_COUNT;
             if (esp_wifi_scan_get_ap_records(&ap_number, ap_info) != ESP_OK) {
                 ESP_LOGI(TAG, "Failed esp_wifi_scan_get_ap_records");
+                ap_number = 0;
             }
             is_scanning = false;
+        }
+
+        // Hotspot bookkeeping must run even during a scan.
+        if (event_id == WIFI_EVENT_AP_START) {
+            ESP_LOGI(TAG, "Configuration Access Point enabled");
+            GLOBAL_STATE->SYSTEM_MODULE.ap_enabled = true;
+        }
+        if (event_id == WIFI_EVENT_AP_STOP) {
+            ESP_LOGI(TAG, "Configuration Access Point disabled");
+            GLOBAL_STATE->SYSTEM_MODULE.ap_enabled = false;
+        }
+        if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+            clients_connected_to_ap += 1;
+        }
+        if (event_id == WIFI_EVENT_AP_STADISCONNECTED && clients_connected_to_ap > 0) {
+            clients_connected_to_ap -= 1;
         }
 
         if (is_scanning) {
@@ -404,7 +453,12 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
             return;
         }
 
-        if (event_id == WIFI_EVENT_STA_START) {
+        if (event_id == WIFI_EVENT_STA_START && !sta_configured) {
+            ESP_LOGI(TAG, "No Wi-Fi saved: setup hotspot only");
+            strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Setup: choose a Wi-Fi network");
+        }
+
+        if (event_id == WIFI_EVENT_STA_START && sta_configured) {
             ESP_LOGI(TAG, "Connecting...");
             strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connecting...");
             esp_wifi_connect();
@@ -424,6 +478,9 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
 
         if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
+            if (!sta_configured) {
+                return;
+            }
             if (event->reason == WIFI_REASON_ROAMING) {
                 ESP_LOGI(TAG, "We are roaming, nothing to do");
                 return;
@@ -454,23 +511,6 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
             }            
         }
         
-        if (event_id == WIFI_EVENT_AP_START) {
-            ESP_LOGI(TAG, "Configuration Access Point enabled");
-            GLOBAL_STATE->SYSTEM_MODULE.ap_enabled = true;
-        }
-                
-        if (event_id == WIFI_EVENT_AP_STOP) {
-            ESP_LOGI(TAG, "Configuration Access Point disabled");
-            GLOBAL_STATE->SYSTEM_MODULE.ap_enabled = false;
-        }
-
-        if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-            clients_connected_to_ap += 1;
-        }
-        
-        if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-            clients_connected_to_ap -= 1;
-        }
     }
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -741,6 +781,7 @@ void wifi_init(GlobalState * GLOBAL_STATE)
     /* Skip connection if SSID is null */
     if (strlen(GLOBAL_STATE->SYSTEM_MODULE.ssid) == 0) {
         ESP_LOGI(TAG, "No WiFi SSID provided, skipping connection");
+        sta_configured = false;
 
         /* Start WiFi */
         ESP_ERROR_CHECK(esp_wifi_start());
@@ -752,6 +793,7 @@ void wifi_init(GlobalState * GLOBAL_STATE)
     } else {
 
         char * wifi_pass = nvs_config_get_string(NVS_CONFIG_WIFI_PASS);
+        sta_configured = true;
 
         /* Initialize STA */
         ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");

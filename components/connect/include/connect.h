@@ -22,6 +22,7 @@ void toggle_wifi_softap(void);
 void wifi_init(GlobalState * GLOBAL_STATE);
 esp_err_t wifi_apply_hostname(const char *hostname);
 esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count);
+uint16_t wifi_scan_max_records(void);  // capacity wifi_scan() may fill
 esp_err_t get_wifi_current_rssi(int8_t *rssi);
 bool wifi_is_connected(void);
 esp_err_t update_mdns_hostname(const char *new_hostname, GlobalState *GLOBAL_STATE);

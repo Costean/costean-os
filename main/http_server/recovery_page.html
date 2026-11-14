@@ -26,6 +26,7 @@ body {
                                      |___/
 </pre>
 <p>Please upload www.bin to recover AxeOS</p>
+<p><b>Only www.bin goes here.</b> This page cannot update the firmware: for esp-miner.bin use Update &amp; Recovery in the main web UI (the miner refuses a firmware file here).</p>
 <p>After clicking upload, please wait 60 seconds<br>
 DO NOT restart the device until response is received</p>
 <input type="file" id="wwwfile" name="wwwfile"><br>
@@ -44,17 +45,29 @@ function handleUpload() {
   const fileInput = document.getElementById('wwwfile');
   const file = fileInput.files[0];
   const uploadUrl = '/api/system/OTAWWW';
+  if (!file) { statusMsg.textContent = 'Pick www.bin first.'; return; }
+  const peek = new FileReader();
+  peek.onload = function() {
+    if (new Uint8Array(peek.result)[0] === 0xE9) {
+      statusMsg.textContent = 'That is a firmware file (esp-miner.bin), not www.bin. Use Update & Recovery in the main web UI. Nothing was uploaded.';
+      return;
+    }
+    sendWww(file, uploadUrl);
+  };
+  peek.readAsArrayBuffer(file.slice(0, 1));
+}
+function sendWww(file, uploadUrl) {
   const upload_xhr = new XMLHttpRequest();
   upload_xhr.open('POST', uploadUrl, true);
   upload_xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   upload_xhr.onload = function() {
       const responseBody = upload_xhr.responseText;
       if (upload_xhr.status === 200) {
-          statusMsg.innerHTML = 'Upload successful!';
+          statusMsg.textContent = 'Upload successful!';
       } else {
-          statusMsg.innerHTML='Error uploading!';
+          statusMsg.textContent = 'Error uploading!';
       }
-      responseMsg.innerHTML = responseBody;
+      responseMsg.textContent = responseBody;
   };
   statusMsg.innerHTML = 'uploading...';
   upload_xhr.send(file);

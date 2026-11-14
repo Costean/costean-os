@@ -47,6 +47,9 @@ typedef struct {
 static const char * TAG = "nvs_config";
 
 static QueueHandle_t nvs_save_queue = NULL;
+static volatile uint32_t s_write_errors = 0;   // Costean OS: failed flash writes since boot (shown in /api/system/info)
+
+uint32_t nvs_config_write_errors(void) { return s_write_errors; }
 static nvs_handle_t handle;
 static SemaphoreHandle_t nvs_cache_mutex = NULL;
 
@@ -127,6 +130,15 @@ static Settings settings[NVS_CONFIG_COUNT] = {
     [NVS_CONFIG_TPS546_SYNC_CONFIG]                    = {.nvs_key_name = "tps546_sync",    .type = TYPE_U16},
     [NVS_CONFIG_TPS546_FREQUENCY]                      = {.nvs_key_name = "tps546_freq",    .type = TYPE_U16},
     [NVS_CONFIG_NOMINAL_VOLTAGE]                       = {.nvs_key_name = "nominal_voltage", .type = TYPE_U16},
+
+    [NVS_CONFIG_POOL_SPLIT_ENABLED]                    = {.nvs_key_name = "poolsplit",       .type = TYPE_BOOL,                                                                         .rest_name = "poolSplitEnabled",                   .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_WEBHOOK]                       = {.nvs_key_name = "dcwebhook",       .type = TYPE_STR,   .default_value = {.str = ""},                                          .min = 0,  .max = NVS_STR_LIMIT},
+    [NVS_CONFIG_DISCORD_ENABLED]                       = {.nvs_key_name = "dcenabled",       .type = TYPE_BOOL,                                                                         .rest_name = "discordEnabled",                     .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_BLOCK_FOUND]                   = {.nvs_key_name = "dcblock",         .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordBlockFound",                  .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_BEST_DIFF]                     = {.nvs_key_name = "dcbestdiff",      .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordBestDiff",                    .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_OFFLINE]                       = {.nvs_key_name = "dcoffline",       .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordOffline",                     .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_OVERHEAT]                      = {.nvs_key_name = "dcoverheat",      .type = TYPE_BOOL,  .default_value = {.b = true},                                          .rest_name = "discordOverheat",                    .min = 0,  .max = 1},
+    [NVS_CONFIG_DISCORD_STATUS_MINUTES]                = {.nvs_key_name = "dcstatusmin",     .type = TYPE_U16,                                                                          .rest_name = "discordStatusMinutes",               .min = 0,  .max = 1440},
 };
 
 Settings *nvs_config_get_settings(NvsConfigKey key)
@@ -346,34 +358,11 @@ static void nvs_task(void *pvParameters)
                 char key[NVS_KEY_NAME_MAX_SIZE];
                 get_nvs_key_name(setting, update.index, key);
 
-                // NVS flash write is AFTER releasing the mutex so getters are never blocked
-                char *old_str = NULL;
+                // Costean OS: the in-memory value was already updated by the setter (see cache_store),
+                // so code that reads a setting right after saving it sees the new value. This task only
+                // writes flash.
                 char nvs_str_buf[32]; // for TYPE_FLOAT serialisation
-                xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
-                setting->is_set = true;
-                switch (update.type) {
-                    case TYPE_STR:
-                        old_str = setting->value[update.index].str;
-                        setting->value[update.index].str = update.value.str;
-                        break;
-                    case TYPE_U16:
-                        setting->value[update.index].u16 = update.value.u16;
-                        break;
-                    case TYPE_I32:
-                        setting->value[update.index].i32 = update.value.i32;
-                        break;
-                    case TYPE_U64:
-                        setting->value[update.index].u64 = update.value.u64;
-                        break;
-                    case TYPE_FLOAT:
-                        setting->value[update.index].f = update.value.f;
-                        snprintf(nvs_str_buf, sizeof(nvs_str_buf), "%f", update.value.f);
-                        break;
-                    case TYPE_BOOL:
-                        setting->value[update.index].b = update.value.b;
-                        break;
-                }
-                xSemaphoreGive(nvs_cache_mutex);
+                if (update.type == TYPE_FLOAT) snprintf(nvs_str_buf, sizeof(nvs_str_buf), "%f", update.value.f);
 
                 switch (update.type) {
                     case TYPE_STR:
@@ -398,14 +387,19 @@ static void nvs_task(void *pvParameters)
 
                 nvs_config_apply_fallback(update.key, setting);
 
+                if (ret != ESP_OK) {
+                    s_write_errors++;
+                    ESP_LOGE(TAG, "Failed to write %s to NVS: %s", key, esp_err_to_name(ret));
+                }
                 if (ret == ESP_OK) {
                     ret = nvs_commit(handle);
                     if (ret != ESP_OK) {
+                        s_write_errors++;
                         ESP_LOGE(TAG, "Failed to commit data to NVS");
                     }
                 }
-                if (old_str) free(old_str);
-            } 
+                if (update.type == TYPE_STR) free(update.value.str);
+            }
             else if (update.type == TYPE_STR) {
                 free(update.value.str);
             }
@@ -599,6 +593,31 @@ char *nvs_config_get_string_indexed(NvsConfigKey key, int index)
     return result;
 }
 
+/* Costean OS: update the in-memory copy right away (stock ESP-Miner only updated it later in
+ * nvs_task, so a setting read straight after a save, e.g. SYSTEM_load_pool_from_nvs() after a pool
+ * PATCH, still returned the old value and the page showed the old pool again). The flash write is
+ * still queued to nvs_task. */
+static void cache_store(Settings *setting, const ConfigUpdate *u)
+{
+    char *old_str = NULL;
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    setting->is_set = true;
+    switch (u->type) {
+        case TYPE_STR: {
+            char *copy = strdup(u->value.str);
+            if (copy) { old_str = setting->value[u->index].str; setting->value[u->index].str = copy; }
+            break;
+        }
+        case TYPE_U16: setting->value[u->index].u16 = u->value.u16; break;
+        case TYPE_I32: setting->value[u->index].i32 = u->value.i32; break;
+        case TYPE_U64: setting->value[u->index].u64 = u->value.u64; break;
+        case TYPE_FLOAT: setting->value[u->index].f = u->value.f; break;
+        case TYPE_BOOL: setting->value[u->index].b = u->value.b; break;
+    }
+    xSemaphoreGive(nvs_cache_mutex);
+    if (old_str) free(old_str);
+}
+
 void nvs_config_set_string(NvsConfigKey key, const char *value)
 {
     Settings *setting = nvs_config_get_settings(key);
@@ -606,6 +625,7 @@ void nvs_config_set_string(NvsConfigKey key, const char *value)
 
     ConfigUpdate update = { .key = key, .type = TYPE_STR, .value.str = strdup(value) };
     if (!update.value.str) return;
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 
@@ -618,6 +638,7 @@ void nvs_config_set_string_indexed(NvsConfigKey key, int index, const char *valu
 
     ConfigUpdate update = { .key = key, .type = TYPE_STR, .value.str = strdup(value), .index = index };
     if (!update.value.str) return;
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 
@@ -644,6 +665,7 @@ void nvs_config_set_u16(NvsConfigKey key, uint16_t value)
     if (!setting || setting->type != TYPE_U16 || setting->value[0].u16 == value) return;
 
     ConfigUpdate update = { .key = key, .type = TYPE_U16, .value.u16 = value };
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 
@@ -670,6 +692,7 @@ void nvs_config_set_i32(NvsConfigKey key, int32_t value)
     if (!setting || setting->type != TYPE_I32 || setting->value[0].i32 == value) return;
 
     ConfigUpdate update = { .key = key, .type = TYPE_I32, .value.i32 = value };
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 
@@ -696,6 +719,7 @@ void nvs_config_set_u64(NvsConfigKey key, uint64_t value)
     if (!setting || setting->type != TYPE_U64 || setting->value[0].u64 == value) return;
 
     ConfigUpdate update = { .key = key, .type = TYPE_U64, .value.u64 = value };
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 
@@ -722,6 +746,7 @@ void nvs_config_set_float(NvsConfigKey key, float value)
     if (!setting || setting->type != TYPE_FLOAT || fabsf(setting->value[0].f - value) < 0.001f) return;
 
     ConfigUpdate update = { .key = key, .type = TYPE_FLOAT, .value.f = value };
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 
@@ -748,6 +773,7 @@ void nvs_config_set_bool(NvsConfigKey key, bool value)
     if (!setting || setting->type != TYPE_BOOL || setting->value[0].b == value) return;
 
     ConfigUpdate update = { .key = key, .type = TYPE_BOOL, .value.b = value };
+    cache_store(setting, &update);
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
 }
 

@@ -39,6 +39,7 @@ typedef struct PoolConfig
     uint16_t sv2_channel_type;
     char * sv2_authority_pubkey;
     bool sv2_require_auth;
+    uint16_t split_percent;
 } PoolConfig;
 
 #define HISTORY_LENGTH 100

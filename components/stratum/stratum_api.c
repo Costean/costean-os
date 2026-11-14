@@ -212,6 +212,93 @@ char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
     return line;
 }
 
+int STRATUM_V1_recv_buf_init(stratum_recv_buf_t *rb, size_t size)
+{
+    if (!rb || size < 64) {
+        return -1;
+    }
+    rb->buf = calloc(1, size);
+    if (!rb->buf) {
+        rb->size = 0;
+        return -1;
+    }
+    rb->size = size;
+    return 0;
+}
+
+void STRATUM_V1_recv_buf_reset(stratum_recv_buf_t *rb)
+{
+    if (rb && rb->buf && rb->size) {
+        rb->buf[0] = '\0';
+    }
+}
+
+void STRATUM_V1_recv_buf_free(stratum_recv_buf_t *rb)
+{
+    if (!rb) {
+        return;
+    }
+    free(rb->buf);
+    rb->buf = NULL;
+    rb->size = 0;
+}
+
+char *STRATUM_V1_receive_jsonrpc_line_buf(esp_transport_handle_t transport, stratum_recv_buf_t *rb)
+{
+    if (!rb || !rb->buf || rb->size < 2) {
+        return NULL;
+    }
+
+    char recv_buffer[BUFFER_SIZE];
+    int nbytes;
+
+    while (!strstr(rb->buf, "\n")) {
+        memset(recv_buffer, 0, BUFFER_SIZE);
+        nbytes = esp_transport_read(transport, recv_buffer, BUFFER_SIZE - 1, TRANSPORT_TIMEOUT_MS);
+        if (nbytes < 0) {
+            ESP_LOGE(TAG, "Error: transport read failed (code: %d)", nbytes);
+            STRATUM_V1_recv_buf_reset(rb);
+            return NULL;
+        }
+        if (nbytes == 0) {
+            continue;
+        }
+        size_t used = strlen(rb->buf);
+        if (used + (size_t)nbytes + 1 > rb->size) {
+            size_t new_size = rb->size;
+            while (used + (size_t)nbytes + 1 > new_size) {
+                new_size *= 2;
+            }
+            char *nbuf = realloc(rb->buf, new_size);
+            if (!nbuf) {
+                ESP_LOGE(TAG, "Failed to grow stratum recv buffer");
+                STRATUM_V1_recv_buf_reset(rb);
+                return NULL;
+            }
+            rb->buf = nbuf;
+            rb->size = new_size;
+        }
+        memcpy(rb->buf + used, recv_buffer, nbytes);
+        rb->buf[used + nbytes] = '\0';
+    }
+
+    char *newline_pos = strchr(rb->buf, '\n');
+    if (!newline_pos) {
+        return NULL;
+    }
+    size_t line_len = (size_t)(newline_pos - rb->buf);
+    char *line = strndup(rb->buf, line_len);
+    size_t buflen = strlen(rb->buf);
+    size_t remaining_len = buflen - line_len - 1;
+    if (remaining_len > 0) {
+        memmove(rb->buf, newline_pos + 1, remaining_len);
+        rb->buf[remaining_len] = '\0';
+    } else {
+        rb->buf[0] = '\0';
+    }
+    return line;
+}
+
 void STRATUM_V1_reset_message(StratumApiV1Message *message)
 {
     if (message->error_str) {

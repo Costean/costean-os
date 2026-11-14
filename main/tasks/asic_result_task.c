@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "scoreboard.h"
 #include "self_test.h"
+#include "pool_split.h"
 
 static const char *TAG = "asic_result";
 
@@ -107,14 +108,29 @@ void ASIC_result_task(void *pvParameters)
                              ret, errno, strerror(errno));
                 }
             } else {
-                // V1: submit with JSON-RPC
-                uint16_t active_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-                char * user = GLOBAL_STATE->SYSTEM_MODULE.pools[active_idx].user;
+                // V1: submit with JSON-RPC, routing to the pool that owned the job
+                // when Costean split is active.
+                char * user = NULL;
+                esp_transport_handle_t transport = NULL;
+                int uid = 0;
 
-                taskENTER_CRITICAL(&GLOBAL_STATE->stratum_mux);
-                esp_transport_handle_t transport = GLOBAL_STATE->transport;
-                int uid = GLOBAL_STATE->send_uid++;
-                taskEXIT_CRITICAL(&GLOBAL_STATE->stratum_mux);
+                if (pool_split_is_active() && active_job->pool_index >= 0) {
+                    CosteanPoolRuntime *rt = pool_split_get_by_pool_index(active_job->pool_index);
+                    if (rt) {
+                        user = GLOBAL_STATE->SYSTEM_MODULE.pools[rt->pool_index].user;
+                        taskENTER_CRITICAL(&rt->mux);
+                        transport = rt->transport;
+                        uid = rt->send_uid++;
+                        taskEXIT_CRITICAL(&rt->mux);
+                    }
+                } else {
+                    uint16_t active_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
+                    user = GLOBAL_STATE->SYSTEM_MODULE.pools[active_idx].user;
+                    taskENTER_CRITICAL(&GLOBAL_STATE->stratum_mux);
+                    transport = GLOBAL_STATE->transport;
+                    uid = GLOBAL_STATE->send_uid++;
+                    taskEXIT_CRITICAL(&GLOBAL_STATE->stratum_mux);
+                }
 
                 if (transport == NULL) {
                     ESP_LOGW(TAG, "No stratum connection, dropping share (job 0x%02X)", job_id);

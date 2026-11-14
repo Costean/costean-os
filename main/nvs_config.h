@@ -84,6 +84,16 @@ typedef enum {
     NVS_CONFIG_TPS546_SYNC_CONFIG,
     NVS_CONFIG_TPS546_FREQUENCY,
     NVS_CONFIG_NOMINAL_VOLTAGE,
+
+    NVS_CONFIG_POOL_SPLIT_ENABLED,
+    NVS_CONFIG_DISCORD_WEBHOOK,
+    NVS_CONFIG_DISCORD_ENABLED,
+    NVS_CONFIG_DISCORD_BLOCK_FOUND,
+    NVS_CONFIG_DISCORD_BEST_DIFF,
+    NVS_CONFIG_DISCORD_OFFLINE,
+    NVS_CONFIG_DISCORD_OVERHEAT,
+    NVS_CONFIG_DISCORD_STATUS_MINUTES,
+
     NVS_CONFIG_COUNT
 } NvsConfigKey;
 
@@ -134,6 +144,7 @@ void nvs_config_set_float(NvsConfigKey key, float value);
 bool nvs_config_get_bool(NvsConfigKey key);
 void nvs_config_set_bool(NvsConfigKey key, bool value);
 bool nvs_config_has_key(NvsConfigKey key);
+uint32_t nvs_config_write_errors(void);   // failed NVS flash writes since boot
 Settings *nvs_config_get_settings(NvsConfigKey key);
 
 #endif // MAIN_NVS_CONFIG_H

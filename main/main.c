@@ -15,6 +15,9 @@
 #include "system.h"
 #include "http_server.h"
 #include "protocol_coordinator.h"
+#include "pool_split.h"
+#include "discord_alerts.h"
+#include "costean/costean_core.h"
 #include "i2c_bitaxe.h"
 #include "adc.h"
 #include "nvs_config.h"
@@ -242,9 +245,18 @@ void app_main(void)
     }
 
     if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
-        protocol_coordinator_init(&GLOBAL_STATE);
-        if (xTaskCreateWithCaps(protocol_coordinator_task, "protocol coord", 8192, (void *) &GLOBAL_STATE, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
-            ESP_LOGE(TAG, "Error creating protocol coordinator task");
+        discord_alerts_start(&GLOBAL_STATE);
+        costean_init(&GLOBAL_STATE);
+        pool_split_init(&GLOBAL_STATE);
+        if (pool_split_is_active()) {
+            if (xTaskCreateWithCaps(pool_split_manager_task, "pool split", 8192, (void *) &GLOBAL_STATE, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+                ESP_LOGE(TAG, "Error creating pool split manager task");
+            }
+        } else {
+            protocol_coordinator_init(&GLOBAL_STATE);
+            if (xTaskCreateWithCaps(protocol_coordinator_task, "protocol coord", 8192, (void *) &GLOBAL_STATE, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+                ESP_LOGE(TAG, "Error creating protocol coordinator task");
+            }
         }
     }
 

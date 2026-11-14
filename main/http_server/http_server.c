@@ -14,6 +14,8 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_app_desc.h"
 #include "esp_wifi.h"
 #include "esp_vfs.h"
 
@@ -29,6 +31,10 @@
 #include "cJSON.h"
 #include "global_state.h"
 #include "nvs_config.h"
+#include "pool_split.h"
+#include "discord_alerts.h"
+#include "costean/costean_core.h"
+#include "costean/ota_check.h"
 #include "system.h"
 #include "connect.h"
 #include "statistics_task.h"
@@ -168,7 +174,39 @@ esp_err_t HTTP_send_json(httpd_req_t * req, const cJSON * item, int * prebuffer_
     return ESP_ERR_NO_MEM;
 }
 
-/* Handler for WiFi scan endpoint */
+/* Wi-Fi scan for the setup page (Costean OS).
+ * GET /api/system/wifi/scan            -> cached list if it is under 15 s old, else a fresh scan
+ * GET /api/system/wifi/scan?refresh=1  -> always a fresh scan
+ * One entry per network name (strongest signal kept), hidden networks left out, strongest first. */
+#define WIFI_SCAN_CACHE_US (15LL * 1000 * 1000)
+static wifi_ap_record_simple_t s_scan_cache[32];
+static uint16_t s_scan_cache_count = 0;
+static int64_t s_scan_cache_time = 0;
+
+static uint16_t wifi_scan_dedupe(wifi_ap_record_simple_t *r, uint16_t n)
+{
+    uint16_t out = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        if (r[i].ssid[0] == '\0') continue;               // hidden network: use "enter network name" instead
+        int found = -1;
+        for (uint16_t j = 0; j < out; j++) {
+            if (strcmp(r[j].ssid, r[i].ssid) == 0) { found = j; break; }
+        }
+        if (found >= 0) {
+            if (r[i].rssi > r[found].rssi) r[found] = r[i];
+        } else {
+            r[out++] = r[i];
+        }
+    }
+    for (uint16_t i = 1; i < out; i++) {                  // insertion sort, strongest first
+        wifi_ap_record_simple_t k = r[i];
+        int j = i - 1;
+        while (j >= 0 && r[j].rssi < k.rssi) { r[j + 1] = r[j]; j--; }
+        r[j + 1] = k;
+    }
+    return out;
+}
+
 static esp_err_t GET_wifi_scan(httpd_req_t *req)
 {
     if (is_network_allowed(req) != ESP_OK) {
@@ -176,37 +214,82 @@ static esp_err_t GET_wifi_scan(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
-    // Give some time for the connected flag to take effect
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    
-    wifi_ap_record_simple_t ap_records[20];
-    uint16_t ap_count = 0;
+    bool force = false;
+    char query[32];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "refresh", val, sizeof(val)) == ESP_OK && val[0] == '1') force = true;
+    }
 
-    esp_err_t err = wifi_scan(ap_records, &ap_count);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "WiFi scan failed");
-        return ESP_OK;
+    int64_t now = esp_timer_get_time();
+    bool cached = !force && s_scan_cache_time != 0 && (now - s_scan_cache_time) < WIFI_SCAN_CACHE_US;
+    if (!cached) {
+        uint16_t cap = wifi_scan_max_records();
+        if (cap > sizeof(s_scan_cache) / sizeof(s_scan_cache[0])) cap = sizeof(s_scan_cache) / sizeof(s_scan_cache[0]);
+        wifi_ap_record_simple_t *fresh = calloc(cap > 32 ? cap : 32, sizeof(wifi_ap_record_simple_t));
+        if (fresh == NULL) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_OK;
+        }
+        uint16_t ap_count = 0;
+        esp_err_t err = wifi_scan(fresh, &ap_count);
+        if (err != ESP_OK) {
+            free(fresh);
+            if (s_scan_cache_time == 0) {
+                httpd_resp_set_status(req, "503 Service Unavailable");
+                httpd_resp_sendstr(req, "{\"error\":\"scan busy, try again\",\"networks\":[]}");
+                return ESP_OK;
+            }
+            cached = true;                                // fall back to the last good list
+        } else {
+            if (ap_count > cap) ap_count = cap;
+            s_scan_cache_count = wifi_scan_dedupe(fresh, ap_count);
+            memcpy(s_scan_cache, fresh, s_scan_cache_count * sizeof(wifi_ap_record_simple_t));
+            s_scan_cache_time = esp_timer_get_time();
+            free(fresh);
+        }
     }
 
     cJSON *root = cJSON_CreateObject();
     cJSON *networks = cJSON_CreateArray();
-
-    for (int i = 0; i < ap_count; i++) {
+    for (int i = 0; i < s_scan_cache_count; i++) {
         cJSON *network = cJSON_CreateObject();
-        cJSON_AddStringToObject(network, "ssid", (char *)ap_records[i].ssid);
-        cJSON_AddNumberToObject(network, "rssi", ap_records[i].rssi);
-        cJSON_AddNumberToObject(network, "authmode", ap_records[i].authmode);
+        cJSON_AddStringToObject(network, "ssid", s_scan_cache[i].ssid);
+        cJSON_AddNumberToObject(network, "rssi", s_scan_cache[i].rssi);
+        cJSON_AddNumberToObject(network, "authmode", s_scan_cache[i].authmode);
         cJSON_AddItemToArray(networks, network);
     }
-
     cJSON_AddItemToObject(root, "networks", networks);
+    cJSON_AddBoolToObject(root, "cached", cached);
+    cJSON_AddNumberToObject(root, "ageMs", (double)((esp_timer_get_time() - s_scan_cache_time) / 1000));
 
     esp_err_t res = HTTP_send_json(req, root, &system_wifi_scan_prebuffer_len);
-
     cJSON_Delete(root);
-
     return res;
+}
+
+/* Captive portal: while the setup hotspot is up, send phones to the hotspot's own address so the
+ * sign-in sheet (iOS hotspot-detect, Android generate_204, Windows connecttest) opens the setup page. */
+static void send_captive_redirect(httpd_req_t *req)
+{
+    static char location[32] = "/";
+    strlcpy(location, "/", sizeof(location));
+    if (GLOBAL_STATE->SYSTEM_MODULE.ap_enabled) {
+        esp_netif_ip_info_t ip = { 0 };
+        esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap != NULL && esp_netif_get_ip_info(ap, &ip) == ESP_OK && ip.ip.addr != 0) {
+            snprintf(location, sizeof(location), "http://" IPSTR "/", IP2STR(&ip.ip));
+        } else {
+            strlcpy(location, "http://192.168.4.1/", sizeof(location));
+        }
+    }
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    // iOS requires content in the response to detect a captive portal, simply redirecting is not sufficient.
+    httpd_resp_send(req, "Redirect to the captive portal", HTTPD_RESP_USE_STRLEN);
 }
 
 
@@ -548,6 +631,39 @@ static bool file_exists(const char *path) {
     return (stat(path, &buffer) == 0);
 }
 
+/* Costean OS: UI files are revalidated on every load ("no-cache" + ETag of the running firmware),
+ * instead of upstream's 30-day cache on unhashed assets that kept showing the old UI after an update.
+ * Returns true when a 304 was sent. */
+static bool send_cache_headers(httpd_req_t * req, const char * kind)
+{
+    static char etag[64];
+    if (!etag[0]) {
+        const esp_app_desc_t * d = esp_app_get_description();
+        char sha[9];
+        esp_app_get_elf_sha256(sha, sizeof(sha));
+        snprintf(etag, sizeof(etag), "\"%.32s-%s", d->version, sha);
+    }
+    /* a www.bin can change without a firmware change (it always reboots): add a per-boot number */
+    static uint32_t boot_nonce;
+    if (!boot_nonce) boot_nonce = esp_random() | 1;
+    char tag[80];
+    if (strcmp(kind, "www") == 0) snprintf(tag, sizeof(tag), "%s-www%08lx\"", etag, (unsigned long) boot_nonce);
+    else snprintf(tag, sizeof(tag), "%s-%s\"", etag, kind);
+    char inm[96];
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) == ESP_OK && strcmp(inm, tag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        httpd_resp_set_hdr(req, "ETag", tag);
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        httpd_resp_send(req, NULL, 0);
+        return true;
+    }
+    static char tag_out[80];   // httpd keeps the pointer until the response is sent
+    snprintf(tag_out, sizeof(tag_out), "%s", tag);
+    httpd_resp_set_hdr(req, "ETag", tag_out);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return false;
+}
+
 /* Send HTTP response with the contents of the requested file */
 static esp_err_t rest_common_get_handler_spiffs(httpd_req_t * req)
 {
@@ -572,18 +688,14 @@ static esp_err_t rest_common_get_handler_spiffs(httpd_req_t * req)
 
     int fd = open(file_to_open, O_RDONLY, 0);
     if (fd == -1) {
-        // Set status
-        httpd_resp_set_status(req, "302 Temporary Redirect");
-        // Redirect to the "/" root directory
-        httpd_resp_set_hdr(req, "Location", "/");
-        // iOS requires content in the response to detect a captive portal, simply redirecting is not sufficient.
-        httpd_resp_send(req, "Redirect to the captive portal", HTTPD_RESP_USE_STRLEN);
+        send_captive_redirect(req);
 
         ESP_LOGI(TAG, "Redirecting to root");
         return ESP_OK;
     }
-    if (req->uri[strlen(req->uri) - 1] != '/') {
-        httpd_resp_set_hdr(req, "Cache-Control", "max-age=2592000");
+    if (send_cache_headers(req, "www")) {
+        close(fd);
+        return ESP_OK;
     }
 
     if (serve_gz) {
@@ -630,8 +742,8 @@ static esp_err_t rest_common_get_handler_embedded(httpd_req_t * req)
     const EmbeddedFile *ef = get_embedded_file(rel_path);
     if (ef != NULL) {
         set_content_type_from_file(req, rel_path);
-        if (req->uri[strlen(req->uri) - 1] != '/') {
-            httpd_resp_set_hdr(req, "Cache-Control", "max-age=2592000");
+        if (send_cache_headers(req, "ui")) {
+            return ESP_OK;
         }
         if (ef->is_gzipped) {
             httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
@@ -640,9 +752,7 @@ static esp_err_t rest_common_get_handler_embedded(httpd_req_t * req)
     }
 
     // Redirect to the "/" root directory if not found in embedded
-    httpd_resp_set_status(req, "302 Temporary Redirect");
-    httpd_resp_set_hdr(req, "Location", "/");
-    httpd_resp_send(req, "Redirect to the captive portal", HTTPD_RESP_USE_STRLEN);
+    send_captive_redirect(req);
 
     ESP_LOGI(TAG, "Redirecting to root");
     return ESP_OK;
@@ -771,8 +881,21 @@ static bool validate_pool_json(const cJSON *pool_item, int i) {
 
     if (!validate_string_field(cJSON_GetObjectItem(pool_item, "stratumV2AuthorityPubkey"), "stratumV2AuthorityPubkey", 128, i)) return false;
     if (!validate_bool_or_num(cJSON_GetObjectItem(pool_item, "stratumV2RequireAuth"), "stratumV2RequireAuth", i)) return false;
+    if (!validate_number_range(cJSON_GetObjectItem(pool_item, "splitPercent"), "splitPercent", 0, 100, i)) return false;
 
     return true;
+}
+
+/* Costean OS: a pool entry with an empty URL and an empty user is an empty slot, not an error.
+ * Older Costean UIs sent all four slots, and one empty slot made the firmware reject the whole Save. */
+static bool pool_json_is_empty_slot(const cJSON *pool_item)
+{
+    if (!cJSON_IsObject(pool_item)) return false;
+    const cJSON *url = cJSON_GetObjectItem(pool_item, "stratumURL");
+    const cJSON *user = cJSON_GetObjectItem(pool_item, "stratumUser");
+    bool url_empty = !url || (cJSON_IsString(url) && url->valuestring[0] == '\0');
+    bool user_empty = !user || (cJSON_IsString(user) && user->valuestring[0] == '\0');
+    return url_empty && user_empty;
 }
 
 static void update_pool_nvs(const cJSON *pool_item, int i) {
@@ -815,6 +938,7 @@ static void update_pool_nvs(const cJSON *pool_item, int i) {
     add_string_field_default(p_obj, pool_item, "stratumV2ChannelType", SV2_CHANNEL_TYPE_EXTENDED);
     add_string_field_default(p_obj, pool_item, "stratumV2AuthorityPubkey", "");
     add_bool_field_default(p_obj, pool_item, "stratumV2RequireAuth", false);
+    add_number_field_default(p_obj, pool_item, "splitPercent", 0);
 
     char *json_str = cJSON_PrintUnformatted(p_obj);
     if (json_str) {
@@ -943,11 +1067,68 @@ bool check_settings_and_update(const cJSON * const root, char **redirect_url)
                     result = false;
                     break;
                 }
+                if (pool_json_is_empty_slot(pool_item)) {
+                    // Clearing is fine for spare slots; the primary pool must always have a URL and user.
+                    if (idx == nvs_config_get_u16(NVS_CONFIG_PRIMARY_POOL_INDEX)) {
+                        ESP_LOGW(TAG, "Pool %d is the primary pool and needs a URL and user", idx);
+                        result = false;
+                        break;
+                    }
+                    continue;
+                }
                 if (!validate_pool_json(pool_item, idx)) {
                     result = false;
                     break;
                 }
             }
+        }
+    }
+
+    /* Validate a requested pool split against the pools that will be stored. */
+    cJSON *split_en = cJSON_GetObjectItem(root, "poolSplitEnabled");
+    if (result && split_en && (cJSON_IsTrue(split_en) || (cJSON_IsNumber(split_en) && split_en->valueint != 0))) {
+        pool_split_config_t scfg;
+        memset(&scfg, 0, sizeof(scfg));
+        scfg.count = COSTEAN_MAX_SPLIT_POOLS;
+        for (int i = 0; i < COSTEAN_MAX_SPLIT_POOLS; i++) {
+            PoolConfig *pc = &GLOBAL_STATE->SYSTEM_MODULE.pools[i];
+            scfg.percent[i] = pc->split_percent;
+            scfg.is_sv2[i] = (pc->protocol == STRATUM_PROTOCOL_V2);
+            scfg.has_url[i] = (pc->url && pc->url[0] != '\0');
+        }
+        if (pools_item && cJSON_IsArray(pools_item)) {
+            int size = cJSON_GetArraySize(pools_item);
+            for (int i = 0; i < size; i++) {
+                cJSON *pool_item = cJSON_GetArrayItem(pools_item, i);
+                cJSON *id_item = cJSON_GetObjectItem(pool_item, "id");
+                if (!id_item || !cJSON_IsNumber(id_item)) continue;
+                int idx = id_item->valueint;
+                if (idx < 0 || idx >= COSTEAN_MAX_SPLIT_POOLS) continue;
+                cJSON *sp = cJSON_GetObjectItem(pool_item, "splitPercent");
+                if (cJSON_IsNumber(sp)) scfg.percent[idx] = (uint16_t)sp->valueint;
+                cJSON *url = cJSON_GetObjectItem(pool_item, "stratumURL");
+                scfg.has_url[idx] = url && cJSON_IsString(url) && url->valuestring && url->valuestring[0];
+                cJSON *proto = cJSON_GetObjectItem(pool_item, "stratumProtocol");
+                scfg.is_sv2[idx] = proto && cJSON_IsString(proto) && strcmp(proto->valuestring, "SV2") == 0;
+            }
+        }
+        pool_split_error_t err = pool_split_validate(&scfg, true);
+        if (err != POOL_SPLIT_OK) {
+            ESP_LOGW(TAG, "Rejected pool split: %s", pool_split_error_string(err));
+            result = false;
+        }
+    }
+
+    cJSON *hook_item = cJSON_GetObjectItem(root, "discordWebhook");
+    if (hook_item && !cJSON_IsString(hook_item)) {
+        ESP_LOGW(TAG, "discordWebhook must be a string");
+        result = false;
+    } else if (hook_item && hook_item->valuestring[0] != '\0') {
+        const char *u = hook_item->valuestring;
+        if (strncmp(u, "https://", 8) != 0 ||
+            (strstr(u, "discord.com/api/webhooks/") == NULL && strstr(u, "discordapp.com/api/webhooks/") == NULL)) {
+            ESP_LOGW(TAG, "discordWebhook is not a Discord webhook URL");
+            result = false;
         }
     }
 
@@ -997,6 +1178,10 @@ bool check_settings_and_update(const cJSON * const root, char **redirect_url)
             }
         }
 
+        if (hook_item && cJSON_IsString(hook_item)) {
+            nvs_config_set_string(NVS_CONFIG_DISCORD_WEBHOOK, hook_item->valuestring);
+        }
+
         // Save pools array to NVS
         if (pools_item && cJSON_IsArray(pools_item)) {
             int size = cJSON_GetArraySize(pools_item);
@@ -1006,7 +1191,18 @@ bool check_settings_and_update(const cJSON * const root, char **redirect_url)
                 if (id_item && cJSON_IsNumber(id_item)) {
                     int idx = id_item->valueint;
                     if (idx >= 0 && idx < MAX_POOLS) {
-                        update_pool_nvs(pool_item, idx);
+                        if (pool_json_is_empty_slot(pool_item)) {
+                            char *cur = nvs_config_get_string_indexed(NVS_CONFIG_POOL, idx);
+                            bool had = cur && cur[0];
+                            free(cur);
+                            // An empty fallback slot is left alone (it may hold the stock fallback pool).
+                            if (had && idx != nvs_config_get_u16(NVS_CONFIG_SECONDARY_POOL_INDEX)) {
+                                nvs_config_set_string_indexed(NVS_CONFIG_POOL, idx, "");
+                                SYSTEM_load_pool_from_nvs(GLOBAL_STATE, idx);
+                            }
+                        } else {
+                            update_pool_nvs(pool_item, idx);
+                        }
                     }
                 }
             }
@@ -1187,6 +1383,7 @@ static esp_err_t POST_restart(httpd_req_t * req)
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     // Restart the system
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     // This return statement will never be reached, but it's good practice to include it
@@ -1376,6 +1573,97 @@ static esp_err_t POST_mining_resume(httpd_req_t * req)
     return res;
 }
 
+static esp_err_t POST_discord_test(httpd_req_t * req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    cJSON *resp = cJSON_CreateObject();
+    if (!discord_webhook_is_configured()) {
+        cJSON_AddBoolToObject(resp, "ok", false);
+        cJSON_AddStringToObject(resp, "message", "No Discord webhook is configured");
+        HTTP_send_json(req, resp, &api_common_prebuffer_len);
+        cJSON_Delete(resp);
+        return ESP_OK;
+    }
+    bool queued = discord_alerts_send_test();
+    cJSON_AddBoolToObject(resp, "ok", queued);
+    cJSON_AddStringToObject(resp, "message", queued ? "Test message queued" : "Failed to queue test message");
+    HTTP_send_json(req, resp, &api_common_prebuffer_len);
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
+
+/* Costean OS: GET /api/costean (status + config), GET /api/costean/history, PATCH /api/costean */
+static esp_err_t GET_costean(httpd_req_t * req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    cJSON *root;
+    if (strncmp(req->uri, "/api/costean/history", 20) == 0) {
+        root = costean_history_json();
+    } else if (strcmp(req->uri, "/api/costean") == 0 || strncmp(req->uri, "/api/costean?", 13) == 0) {
+        root = cJSON_CreateObject();
+        cJSON_AddItemToObject(root, "status", costean_status_json());
+        cJSON_AddItemToObject(root, "config", costean_config_json());
+    } else {
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+    }
+    esp_err_t res = HTTP_send_json(req, root, &api_common_prebuffer_len);
+    cJSON_Delete(root);
+    return res;
+}
+
+static esp_err_t PATCH_costean(httpd_req_t * req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    int total_len = req->content_len;
+    char * buf = ((rest_server_context_t *) (req->user_ctx))->scratch;
+    if (total_len <= 0 || total_len >= SCRATCH_BUFSIZE) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad length");
+    }
+    int cur_len = 0;
+    while (cur_len < total_len) {
+        int received = httpd_req_recv(req, buf + cur_len, total_len - cur_len);
+        if (received <= 0) {
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "receive failed");
+        }
+        cur_len += received;
+    }
+    buf[total_len] = '\0';
+    cJSON *body = cJSON_Parse(buf);
+    if (!body) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    }
+    const char *err = costean_patch_config(body);
+    cJSON_Delete(body);
+    if (err) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+    }
+    httpd_resp_set_type(req, "application/json");
+    cJSON *cfg = costean_config_json();
+    esp_err_t res = HTTP_send_json(req, cfg, &api_common_prebuffer_len);
+    cJSON_Delete(cfg);
+    return res;
+}
+
 /* Simple handler for getting system handler */
 static esp_err_t GET_system_info(httpd_req_t * req)
 {
@@ -1491,6 +1779,7 @@ static esp_err_t POST_system_boot(httpd_req_t *req)
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     // Restart the system
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     return send_res;
@@ -1655,6 +1944,43 @@ static esp_err_t GET_scoreboard(httpd_req_t * req)
     return res;
 }
 
+/* Costean OS: read the start of an upload (to check it before anything is erased or written). */
+static int recv_head(httpd_req_t * req, char * buf, int want)
+{
+    int got = 0;
+    want = MIN(want, (int) req->content_len);
+    int timeouts = 0;
+    while (got < want) {
+        int r = httpd_req_recv(req, buf + got, want - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) { if (++timeouts > 20) return -1; continue; }
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return got;
+}
+
+static void update_failed(const char * status)
+{
+    snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "%s", status);
+    ESP_LOGW(TAG, "Update refused / failed: %s", status);
+    /* do not leave the OLED on the update screen when nothing is being written */
+    GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = false;
+}
+
+static esp_err_t send_update_ok(httpd_req_t * req, const char * message, const char * version)
+{
+    httpd_resp_set_type(req, "application/json");
+    set_cors_headers(req);
+    cJSON * root = cJSON_CreateObject();
+    if (root == NULL) return httpd_resp_sendstr(req, "{}");
+    cJSON_AddStringToObject(root, "message", message);
+    if (version) cJSON_AddStringToObject(root, "version", version);
+    int prebuffer_len = 160;
+    esp_err_t res = HTTP_send_json(req, root, &prebuffer_len);
+    cJSON_Delete(root);
+    return res;
+}
+
 esp_err_t POST_WWW_update(httpd_req_t * req)
 {
     if (is_network_allowed(req) != ESP_OK) {
@@ -1665,16 +1991,9 @@ esp_err_t POST_WWW_update(httpd_req_t * req)
     esp_wifi_get_mode(&mode);
     if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA)
     {
-        HTTP_send_json_error(req, "500 Internal Server Error", "Not allowed in AP mode");
+        HTTP_send_json_error(req, "500 Internal Server Error", "Not allowed while the setup Wi-Fi (AP) is on. Connect the miner to your Wi-Fi first.");
         return ESP_OK;
     }
-
-    GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = true;
-    snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_filename, 20, "www.bin");
-    snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Starting...");
-
-    char buf[1000];
-    int remaining = req->content_len;
 
     const esp_partition_t * www_partition =
         esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "www");
@@ -1683,56 +2002,81 @@ esp_err_t POST_WWW_update(httpd_req_t * req)
         return ESP_OK;
     }
 
-    // Don't attempt to write more than what can be stored in the partition
-    if (remaining > www_partition->size) {
-        HTTP_send_json_error(req, "400 Bad Request", "File provided is too large for device");
+    /* Costean OS: check the file BEFORE erasing anything. Upstream accepted any file here, so an
+     * esp-miner.bin sent to this box "succeeded", rebooted and left the old firmware running. */
+    char buf[1000];
+    int head = recv_head(req, buf, sizeof(buf));
+    if (head < 0) {
+        HTTP_send_json_error(req, "500 Internal Server Error", "Upload interrupted. Nothing was changed.");
+        return ESP_FAIL;
+    }
+    const char * why = costean_check_www_image((const uint8_t *) buf, head, req->content_len, www_partition->size);
+    if (why) {
+        ESP_LOGW(TAG, "www upload refused: %s", why);
+        HTTP_send_json_error(req, "400 Bad Request", why);
         return ESP_OK;
     }
+
+    GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = true;
+    snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_filename, 20, "www.bin");
+    snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Starting...");
 
     // Erase the entire www partition before writing, in chunks to prevent WDT timeout
     size_t erase_size = 65536; // 64KB chunks
     for (size_t offset = 0; offset < www_partition->size; offset += erase_size) {
         size_t size_to_erase = MIN(erase_size, www_partition->size - offset);
-        ESP_ERROR_CHECK(esp_partition_erase_range(www_partition, offset, size_to_erase));
+        if (esp_partition_erase_range(www_partition, offset, size_to_erase) != ESP_OK) {
+            update_failed("Erase Error");
+            HTTP_send_json_error(req, "500 Internal Server Error", "Could not erase the web UI partition");
+            return ESP_FAIL;
+        }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
+    int remaining = req->content_len;
+    size_t offset = 0;
     int chunks = 0;
+    int pending = head;   // the bytes already read for the check
     while (remaining > 0) {
-        int recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
-
-        if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
-            continue;
-        } else if (recv_len <= 0) {
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Protocol Error");
-            HTTP_send_json_error(req, "500 Internal Server Error", "Protocol Error");
-            return ESP_FAIL;
+        int recv_len = pending;
+        if (pending) {
+            pending = 0;
+        } else {
+            recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
+            if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            } else if (recv_len <= 0) {
+                update_failed("Protocol Error");
+                nvs_config_set_bool(NVS_CONFIG_USE_CUSTOM_WWW, false);   // half-written: use the built-in UI
+                HTTP_send_json_error(req, "500 Internal Server Error", "Upload interrupted. The built-in web UI will be used.");
+                return ESP_FAIL;
+            }
         }
 
-        if (esp_partition_write(www_partition, www_partition->size - remaining, (const void *) buf, recv_len) != ESP_OK) {
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Write Error");
+        if (esp_partition_write(www_partition, offset, (const void *) buf, recv_len) != ESP_OK) {
+            update_failed("Write Error");
+            nvs_config_set_bool(NVS_CONFIG_USE_CUSTOM_WWW, false);
             HTTP_send_json_error(req, "500 Internal Server Error", "Write Error");
             return ESP_FAIL;
         }
-
+        offset += recv_len;
+        remaining -= recv_len;
 
         uint8_t percentage = 100 - ((remaining * 100 / req->content_len));
         snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Working (%d%%)", percentage);
-
-        remaining -= recv_len;
 
         chunks++;
         if (chunks % 16 == 0) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
     }
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_sendstr(req, "WWW update complete, rebooting now!\n");
     nvs_config_set_bool(NVS_CONFIG_USE_CUSTOM_WWW, true);
+    send_update_ok(req, "Web UI update complete, rebooting now. The firmware version does not change.", NULL);
 
     snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Rebooting...");
     vTaskDelay(1000 / portTICK_PERIOD_MS);
     GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = false;
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     return ESP_OK;
@@ -1751,49 +2095,77 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
     esp_wifi_get_mode(&mode);
     if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA)
     {
-        HTTP_send_json_error(req, "500 Internal Server Error", "Not allowed in AP mode");
+        HTTP_send_json_error(req, "500 Internal Server Error", "Not allowed while the setup Wi-Fi (AP) is on. Connect the miner to your Wi-Fi first.");
         return ESP_OK;
     }
-    
+
+    const esp_partition_t * ota_partition = esp_ota_get_next_update_partition(NULL);
+    if (ota_partition == NULL) {
+        HTTP_send_json_error(req, "500 Internal Server Error", "No firmware slot to update");
+        return ESP_OK;
+    }
+
+    /* Costean OS: check the file before writing: an ESP32-S3 "esp-miner" app image that fits.
+     * Refuses www.bin, the factory image and other files with a clear message. */
+    char buf[1000];
+    int head = recv_head(req, buf, sizeof(buf));
+    if (head < 0) {
+        HTTP_send_json_error(req, "500 Internal Server Error", "Upload interrupted. Nothing was changed.");
+        return ESP_FAIL;
+    }
+    char new_version[40];
+    const char * why = costean_check_app_image((const uint8_t *) buf, head, req->content_len, ota_partition->size,
+                                               new_version, sizeof(new_version));
+    if (why) {
+        ESP_LOGW(TAG, "firmware upload refused: %s", why);
+        HTTP_send_json_error(req, "400 Bad Request", why);
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "Firmware upload: %s (%u bytes) -> %s", new_version, (unsigned) req->content_len, ota_partition->label);
+
     GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = true;
     snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_filename, 20, "esp-miner.bin");
     snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Starting...");
 
-    char buf[1000];
     esp_ota_handle_t ota_handle;
+    if (esp_ota_begin(ota_partition, req->content_len, &ota_handle) != ESP_OK) {
+        update_failed("Begin Error");
+        HTTP_send_json_error(req, "500 Internal Server Error", "Could not start the update (flash error). Nothing was changed.");
+        return ESP_OK;
+    }
+
     int remaining = req->content_len;
-
-    const esp_partition_t * ota_partition = esp_ota_get_next_update_partition(NULL);
-    ESP_ERROR_CHECK(esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle));
-
     int chunks = 0;
+    int pending = head;
     while (remaining > 0) {
-        int recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
-
-        // Timeout Error: Just retry
-        if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
-            continue;
-
+        int recv_len = pending;
+        if (pending) {
+            pending = 0;
+        } else {
+            recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
+            // Timeout Error: Just retry
+            if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
             // Serious Error: Abort OTA
-        } else if (recv_len <= 0) {
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Protocol Error");
-            HTTP_send_json_error(req, "500 Internal Server Error", "Protocol Error");
-            return ESP_FAIL;
+            } else if (recv_len <= 0) {
+                esp_ota_abort(ota_handle);
+                update_failed("Protocol Error");
+                HTTP_send_json_error(req, "500 Internal Server Error", "Upload interrupted. The old firmware keeps running.");
+                return ESP_FAIL;
+            }
         }
 
         // Successful Upload: Flash firmware chunk
         if (esp_ota_write(ota_handle, (const void *) buf, recv_len) != ESP_OK) {
             esp_ota_abort(ota_handle);
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Write Error");
-            HTTP_send_json_error(req, "500 Internal Server Error", "Write Error");
+            update_failed("Write Error");
+            HTTP_send_json_error(req, "500 Internal Server Error", "Write Error. The old firmware keeps running.");
             return ESP_FAIL;
         }
 
-        uint8_t percentage = 100 - ((remaining * 100 / req->content_len));
-
-        snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Working (%d%%)", percentage);
-
         remaining -= recv_len;
+        uint8_t percentage = 100 - ((remaining * 100 / req->content_len));
+        snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Working (%d%%)", percentage);
 
         chunks++;
         if (chunks % 16 == 0) {
@@ -1802,9 +2174,12 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
     }
 
     // Validate and switch to new OTA image and reboot
-    if (esp_ota_end(ota_handle) != ESP_OK || esp_ota_set_boot_partition(ota_partition) != ESP_OK) {
-        snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Validation Error");
-        HTTP_send_json_error(req, "500 Internal Server Error", "Validation / Activation Error");
+    esp_err_t end = esp_ota_end(ota_handle);
+    if (end != ESP_OK || esp_ota_set_boot_partition(ota_partition) != ESP_OK) {
+        update_failed("Validation Error");
+        HTTP_send_json_error(req, "500 Internal Server Error",
+                             end == ESP_ERR_OTA_VALIDATE_FAILED ? "The uploaded firmware is damaged (checksum failed). The old firmware keeps running."
+                                                                : "Could not activate the new firmware. The old firmware keeps running.");
         return ESP_OK;
     }
 
@@ -1813,10 +2188,12 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
     // Reset custom WWW so the newly flashed firmware defaults to its matching embedded Web UI
     SYSTEM_reset_custom_www();
 
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Firmware %s written to %s, rebooting now.", new_version, ota_partition->label);
+    send_update_ok(req, msg, new_version);
     ESP_LOGI(TAG, "Restarting System because of Firmware update complete");
     vTaskDelay(1000 / portTICK_PERIOD_MS);
+    costean_before_restart();   // keep the 48 h history
     esp_restart();
 
     return ESP_OK;
@@ -1825,12 +2202,7 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
 // HTTP Error (404) Handler - Redirects all requests to the root page
 esp_err_t http_404_error_handler(httpd_req_t * req, httpd_err_code_t err)
 {
-    // Set status
-    httpd_resp_set_status(req, "302 Temporary Redirect");
-    // Redirect to the "/" root directory
-    httpd_resp_set_hdr(req, "Location", "/");
-    // iOS requires content in the response to detect a captive portal, simply redirecting is not sufficient.
-    httpd_resp_send(req, "Redirect to the captive portal", HTTPD_RESP_USE_STRLEN);
+    send_captive_redirect(req);
 
     ESP_LOGI(TAG, "Redirecting to root");
     return ESP_OK;
@@ -1852,7 +2224,7 @@ esp_err_t start_rest_server(GlobalState * global_state)
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
     config.max_open_sockets = 20;
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 30;
     config.close_fn = websocket_close_fn;
     config.lru_purge_enable = true;
     config.keep_alive_enable = true;
@@ -1981,6 +2353,30 @@ esp_err_t start_rest_server(GlobalState * global_state)
         .user_ctx = NULL
     };
     httpd_register_uri_handler(server, &system_dismiss_block_found_uri);
+
+    httpd_uri_t system_discord_test_uri = {
+        .uri = "/api/system/discord/test",
+        .method = HTTP_POST,
+        .handler = POST_discord_test,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &system_discord_test_uri);
+
+    httpd_uri_t costean_get_uri = {
+        .uri = "/api/costean*",
+        .method = HTTP_GET,
+        .handler = GET_costean,
+        .user_ctx = rest_context
+    };
+    httpd_register_uri_handler(server, &costean_get_uri);
+
+    httpd_uri_t costean_patch_uri = {
+        .uri = "/api/costean",
+        .method = HTTP_PATCH,
+        .handler = PATCH_costean,
+        .user_ctx = rest_context
+    };
+    httpd_register_uri_handler(server, &costean_patch_uri);
 
     httpd_uri_t update_system_settings_uri = {
         .uri = "/api/system", 

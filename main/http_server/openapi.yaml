@@ -323,6 +323,9 @@ components:
         apEnabled:
           type: number
           description: Whether AP mode is enabled (0=no, 1=yes)
+        apSsid:
+          type: string
+          description: Name of the setup hotspot (for example Bitaxe_1A2B)
         autofanspeed:
           type: number
           description: Automatic fan speed control (0=manual, 1=auto)
