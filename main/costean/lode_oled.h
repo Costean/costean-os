@@ -43,6 +43,7 @@ typedef struct {
     bool throttled;
     bool scheduled;          /* profile chosen by a schedule window */
     int tune_steps;          /* auto-tune steps above the profile */
+    char tuner_line[20];     /* "" off, or "LOCK 575/1100" / "TUNE 550/1150" */
     float ghs;
     int mhz, mv;
     float chip_c, vr_c, power_w, fan_pct;

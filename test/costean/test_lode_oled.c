@@ -189,5 +189,29 @@ int main(void)
     test_primitives(); test_helpers(); test_every_screen_draws(); test_big_digits(); test_header_is_plain_text();
     test_hash_page(); test_throttle_and_failover_tags(); test_heat_near_limit(); test_render_clears();
     printf("lode_oled: %d checks, %d failed\n", checks, fails);
-    return fails ? 1 : 0;
+    
+    /* one-line tuner status: HASH bottom replaces MHz/mV; HEAT uses it as the header tag */
+    {
+        lode_view_t v; lode_fb_t fb; memset(&v, 0, sizeof v);
+        v.version = "1.2.0-costean.2"; v.board = "602";
+        snprintf(v.profile, sizeof v.profile, "STOCK");
+        v.ghs = 1090; v.mhz = 575; v.mv = 1100; v.chip_c = 58; v.vr_c = 64; v.power_w = 16;
+        v.lim_chip = 68; v.lim_vr = 90; v.lim_power = 27;
+        snprintf(v.tuner_line, sizeof v.tuner_line, "LOCK 575/1100");
+        lode_render(&fb, LODE_HASH, &v, false);
+        /* bottom line should contain LOCK 575/1100 rather than 575MHz */
+        int found = 0;
+        /* the glyphs are in the framebuffer; use a pixel-text probe via lode boxes if needed.
+           Render a reference frame with the same bottom text and compare the bottom 8 rows. */
+        lode_fb_t want; lode_clear(&want);
+        lode_view_t w = v; w.tuner_line[0] = 0;
+        lode_render(&want, LODE_HASH, &w, false);
+        CHECK(memcmp(&fb, &want, sizeof fb) != 0);
+        lode_render(&fb, LODE_HEAT, &v, false);
+        lode_fb_t heat; lode_render(&heat, LODE_HEAT, &w, false);
+        CHECK(memcmp(&fb, &heat, sizeof fb) != 0);
+        (void)found;
+    }
+
+return fails ? 1 : 0;
 }

@@ -38,7 +38,7 @@
   <div class="card">
     <h2>Device</h2>
     <div class="row"><span>Firmware</span><span class="sp"></span><b class="mono">{i.firmwareName || 'Costean OS'} {i.version || ''}</b></div>
-    <div class="row"><span>Board</span><span class="sp"></span><b class="mono">{i.boardVersion || '602'}</b></div>
+    <div class="row"><span>Board</span><span class="sp"></span><b class="mono">{i.boardVersion || '601/602'}</b></div>
     <div class="row"><span>ASIC</span><span class="sp"></span><b class="mono">{i.ASICModel || 'BM1370'}</b></div>
     <div class="row"><span>MAC</span><span class="sp"></span><b class="mono">{i.macAddr || i.mac || '—'}</b></div>
     <label class="f"><span>Hostname</span><input bind:value={hostname} /></label>

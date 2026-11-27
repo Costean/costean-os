@@ -1,11 +1,11 @@
-// Mock Bitaxe Gamma 602 (bitaxeorg ESP-Miner v2.15.4 API shape + Costean OS /api/costean) serving clearly-labelled DEMO data.
+// Mock Bitaxe Gamma 602 (demo board; firmware also supports 601) plus Costean OS /api/costean, serving clearly-labelled DEMO data.
 // Never talks to a real device. SCENARIO=normal|failover|throttle|block selects the demo state.
 import http from 'node:http'; import fs from 'node:fs'; import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { detectUpdate } from '../src/lib/ota.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = +process.env.PORT || 8099, ROOT = path.resolve(process.env.DIST || path.join(__dirname, '../dist/axe-os'));
-let FW = process.env.FW_VERSION || '1.2.0-costean.1';
+let FW = process.env.FW_VERSION || '1.2.0-costean.2';
 // OTA_NOAPPLY=1 simulates an update that uploads but does not take (the costean.4 report), to preview the failure message
 const OTA_NOAPPLY = process.env.OTA_NOAPPLY === '1'; let downUntil = 0, slot = 'ota_0';
 const SC = process.env.SCENARIO || 'normal', BLOCK = SC === 'block', FAILOVER = SC === 'failover', THROTTLE = SC === 'throttle', SETUP = SC === 'setup' || SC === 'setupfail' || SC === 'joining' || SC === 'crashed';
@@ -21,7 +21,7 @@ const S = { primaryPoolIndex: 0, secondaryPoolIndex: process.env.SCENARIO === 'f
   discordEnabled: 1, discordConfigured: 1, discordWebhookPreview: 'https://discord.com/api/webhooks/12…89/********', discordBlockFound: 1, discordBestDiff: 1, discordOffline: 1, discordOverheat: 1, discordStatusMinutes: 60, autofanspeed: 1, manualFanSpeed: 70, overclockEnabled: 0, invertscreen: 0 };
 const POOL = (id, url, port, pct) => ({ id, stratumProtocol: 'SV1', stratumURL: url, stratumPort: port, stratumUser: 'bc1qDEMOdemoDEMO.costean', stratumPassword: '*****', stratumSuggestedDifficulty: 0, stratumExtranonceSubscribe: false, stratumTLS: 0, stratumCert: '', stratumDecodeCoinbase: true, stratumV2ChannelType: 'extended', stratumV2AuthorityPubkey: '', stratumV2RequireAuth: false, splitPercent: pct });
 const pools = process.env.SCENARIO === 'fresh' ? [POOL(0, 'public-pool.io', 3333, 0), POOL(1, 'solo.ckpool.org', 3333, 0)] : [POOL(0, 'demo-pool.example', 3333, 70), POOL(1, 'solo-demo.example', 3333, 30), POOL(2, 'backup-pool.example', 3333, 0)];
-const CFG = { profile: 'custom', profiles: {}, limits: { chipTemp: 68, vrTemp: 90, power: 27, psu: 30 }, autotune: { enabled: false, maxSteps: 2, maxErrorPct: 1, maxRejectPct: 1, holdMin: 15 },
+const CFG = { profile: 'custom', profiles: {}, limits: { chipTemp: 68, vrTemp: 90, power: 27, psu: 30 }, autotune: { enabled: false, maxSteps: 2, maxErrorPct: 1, maxRejectPct: 1, holdMin: 15, goal: 'efficiency', powerCap: 22 },
   schedule: { enabled: true, tz: 'America/New_York', windows: [
     { on: true, days: 127, start: 1320, end: 420, profile: 'none', lcd: 'dim', name: 'Night screen' },
     { on: true, days: 62, start: 0, end: 360, profile: 'eco', lcd: 'off', name: 'Quiet night' },
@@ -56,8 +56,59 @@ function patchProfiles(o) {   // returns an error or null; mutates CFG only when
   if (!available(CFG.profile)) CFG.profile = 'custom';
   return null;
 }
+
+const TUNER = process.env.TUNER || ''; // searching|trimming|locked|watching
+const TUNER_GOAL = process.env.TUNER_GOAL || (TUNER === 'watching' ? 'power' : 'efficiency');
+if (TUNER) { CFG.autotune.enabled = true; CFG.autotune.goal = TUNER_GOAL; CFG.autotune.powerCap = 22; CFG.profile = 'stock'; }
+function tunerDemo() {
+  if (!TUNER) return null;
+  const logs = {
+    searching: [
+      { mhz: 525, mv: 1150, jth: 14.6, result: 'stable, start' },
+      { mhz: 550, mv: 1150, jth: 14.1, result: 'better J/TH' },
+      { mhz: 575, mv: 1150, jth: 13.9, result: 'better J/TH' },
+      { mhz: 600, mv: 1150, jth: 14.2, result: 'measuring…' },
+    ],
+    trimming: [
+      { mhz: 525, mv: 1150, jth: 14.6, result: 'stable, start' },
+      { mhz: 550, mv: 1150, jth: 14.1, result: 'better J/TH' },
+      { mhz: 575, mv: 1150, jth: 14.3, result: 'worse — peak' },
+      { mhz: 550, mv: 1140, jth: 13.9, result: 'trim, stable' },
+      { mhz: 550, mv: 1110, jth: 13.85, result: 'trimming…' },
+    ],
+    locked: [
+      { mhz: 525, mv: 1150, jth: 14.6, result: 'stable, start' },
+      { mhz: 550, mv: 1150, jth: 14.1, result: 'better J/TH' },
+      { mhz: 575, mv: 1150, jth: 14.3, result: 'worse — peak' },
+      { mhz: 550, mv: 1140, jth: 13.9, result: 'trim, stable' },
+      { mhz: 550, mv: 1100, jth: 13.8, result: 'trim, stable' },
+      { mhz: 550, mv: 1090, jth: 14.0, result: 'errors — stop' },
+      { mhz: 550, mv: 1100, jth: 13.8, result: 'locked with 10 mV margin' },
+    ],
+    watching: [
+      { mhz: 525, mv: 1150, jth: 15.1, result: 'stable, start' },
+      { mhz: 550, mv: 1150, jth: 14.4, result: 'better hashrate, under cap' },
+      { mhz: 550, mv: 1100, jth: 13.8, result: 'trimmed, locked' },
+      { mhz: 550, mv: 1100, jth: 13.8, result: 'watch window stable' },
+    ],
+  };
+  const points = {
+    searching: { trialMhz: 600, trialMv: 1150, jth: 14.2, ghs: 1206, progress: 58, best: { mhz: 575, mv: 1150, ghs: 1155, jth: 13.9 }, note: 'Testing 600 MHz @ 1150 mV. Started from Stock 525 / 1150.' },
+    trimming: { trialMhz: 550, trialMv: 1110, jth: 13.85, ghs: 1105, progress: 42, best: { mhz: 550, mv: 1140, ghs: 1105, jth: 13.9 }, note: 'Trimming voltage at 550 MHz. Next trial 1110 mV.' },
+    locked: { trialMhz: 550, trialMv: 1100, jth: 13.8, ghs: 1105, progress: 100, best: { mhz: 550, mv: 1100, ghs: 1105, jth: 13.8 }, note: 'Locked 550 MHz @ 1100 mV. Efficiency peaked, then trimmed with a 10 mV margin.' },
+    watching: { trialMhz: 550, trialMv: 1100, jth: 13.8, ghs: 1105, progress: 70, best: { mhz: 550, mv: 1100, ghs: 1105, jth: 13.8 }, note: 'Watching 550 MHz @ 1100 mV. Last 10-minute window was stable, under the 22 W cap.' },
+  };
+  const p = points[TUNER];
+  if (!p) return null;
+  return { enabled: true, goal: TUNER_GOAL, powerCap: TUNER_GOAL === 'power' ? 22 : undefined, phase: TUNER, ...p, steps: logs[TUNER] };
+}
 const prof = () => THROTTLE ? 'stock' : CFG.profile;
-const applied = () => THROTTLE ? { mhz: 475, mv: 1150 } : PRESETS()[prof()];
+const applied = () => {
+  if (THROTTLE) return { mhz: 475, mv: 1150 };
+  const td = tunerDemo();
+  if (td) return { mhz: td.trialMhz, mv: td.trialMv };
+  return PRESETS()[prof()];
+};
 function splitStats(hr) {
   const weighted = pools.filter(p => p.splitPercent > 0), up = id => !(FAILOVER && id === 1);
   const live = weighted.filter(p => up(p.id)), sum = live.reduce((a, p) => a + p.splitPercent, 0) || 1;
@@ -68,7 +119,9 @@ function splitStats(hr) {
       healthy: up(p.id), backup: p.splitPercent === 0, jobShare: eff / 100 + (eff ? rnd(-0.004, 0.004) : 0), creditedGhs: eff ? hr * eff / 100 * rnd(0.85, 1.15) : 0 }; });
 }
 function info() {
-  const a = applied(), hr = (THROTTLE ? 1065 : a.mhz * 2040 / 1000 * 0.985) + rnd(-15, 15), w = +(hr / 1000 * 15.4 + rnd(-0.2, 0.2)).toFixed(1);
+  const a = applied(), td = tunerDemo();
+  const hr = td ? td.ghs : (THROTTLE ? 1065 : a.mhz * 2040 / 1000 * 0.985) + rnd(-15, 15);
+  const w = +(td ? td.jth * td.ghs / 1000 : hr / 1000 * 15.4 + rnd(-0.2, 0.2)).toFixed(1);
   return { demo: true, ...S, hashRate: hr, hashRate_1m: hr * 0.99, hashRate_10m: hr, hashRate_1h: hr, expectedHashrate: a.mhz * 2040 / 1000, errorPercentage: 0.38,
     bestDiff: BLOCK ? 1.31e14 : 1.89e9, bestSessionDiff: 4.2e7, networkDifficulty: 1.27e14, poolDifficulty: 1024,
     coreVoltageActual: a.mv - 2, actualFrequency: a.mhz, temp: THROTTLE ? 68.6 : +(58.2 + rnd(-0.3, 0.3)).toFixed(1), temp2: 0, vrTemp: THROTTLE ? 71.2 : +(47.4 + rnd(-0.3, 0.3)).toFixed(1),
@@ -99,7 +152,7 @@ function costean() {
       presets: PRESETS(), profiles: profileList(), envelope: { minMhz: 400, maxMhz: Math.max(1000, Math.round(S.frequency)), stepMhz: 25, maxMv: 1300 },
       schedule: { clockValid: true, profileWindow: -1, lcdWindow: night && CFG.schedule.enabled ? 0 : -1, lcd: night ? 'dim' : 'normal', profile: 'none', localTime: local, dst: false, nextChangeLocal: next },
       zones: ['UTC', 'America/St_Johns', 'America/Halifax', 'America/New_York', 'America/Toronto', 'America/Chicago', 'America/Denver', 'America/Phoenix', 'America/Los_Angeles', 'America/Vancouver', 'Europe/London', 'Europe/Berlin', 'Europe/Helsinki'],
-      failover: FAILOVER, split: { enabled: !!S.poolSplitEnabled, active: !!S.poolSplitEnabled, error: 'ok', restartNeeded: false, failover: FAILOVER }, maxPools: 4 }, config: CFG };
+      tuner: tunerDemo(), failover: FAILOVER, split: { enabled: !!S.poolSplitEnabled, active: !!S.poolSplitEnabled, error: 'ok', restartNeeded: false, failover: FAILOVER }, maxPools: 4 }, config: CFG };
 }
 function rollup() {
   const slot = 900, end = Math.floor(Date.now() / 1000 / slot) * slot, n = 192, start = end - (n - 1) * slot;
@@ -157,7 +210,7 @@ const server = http.createServer(async (req, res) => {
             const i = pools.findIndex(x => x.id === np.id); const keep = { ...POOL(np.id, '', 3333, 0), ...np, stratumPassword: '*****' }; if (i >= 0) pools[i] = keep; else pools.push(keep); }
           for (const k of Object.keys(o)) if (k !== 'pools') S[k] = o[k]; saveNvs(); }
         if (p.startsWith('/api/system/pools/') && m === 'DELETE') { const id = +p.split('/').pop(); if (id === S.primaryPoolIndex || id === S.secondaryPoolIndex) return json(res, 'Cannot delete', 400); const i = pools.findIndex(x => x.id === id); if (i >= 0) pools.splice(i, 1); saveNvs(); }
-        if (p === '/api/costean' && m === 'PATCH') { const o = JSON.parse(b || '{}'); if (o.autotune?.reset) delete o.autotune.reset;
+        if (p === '/api/costean' && m === 'PATCH') { const o = JSON.parse(b || '{}'); if (o.autotune?.reset) delete o.autotune.reset; if (o.autotune?.restart) delete o.autotune.restart;
           if (o.profiles || o.profilesReset) { const before = JSON.stringify(CFG.profiles), bp = CFG.profile; const e = patchProfiles(o);
             if (e) { CFG.profiles = JSON.parse(before); CFG.profile = bp; return json(res, { message: e }, 400); } delete o.profiles; delete o.profilesReset; }
           if (o.profile && !available(o.profile)) return json(res, { message: 'that profile is turned off; turn it on under Edit profiles first' }, 400);
@@ -191,4 +244,4 @@ const server = http.createServer(async (req, res) => {
   if (fs.existsSync(f) && fs.statSync(f).isFile()) { res.writeHead(200, { 'Content-Type': TYPES[path.extname(f)] || 'text/plain' }); return res.end(fs.readFileSync(f)); }
   res.writeHead(302, { Location: '/' }); res.end();
 });
-server.listen(PORT, '127.0.0.1', () => console.log(`DEMO mock Bitaxe Gamma 602 (${SC}) on http://127.0.0.1:${PORT} serving ${ROOT}`));
+server.listen(PORT, '127.0.0.1', () => console.log(`DEMO mock Bitaxe Gamma 601/602 (${SC}) on http://127.0.0.1:${PORT} serving ${ROOT}`));

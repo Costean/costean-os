@@ -1,5 +1,6 @@
 #pragma once
-// Costean OS 1.2 board envelope for the Bitaxe Gamma 602 (1x BM1370, TPS546 regulator, 5 V input).
+// Costean OS 1.2 board envelope for the Bitaxe Gamma 601 and 602 (same FAMILY_GAMMA hardware:
+// 1x BM1370, TPS546 regulator, EMC2101, 5 V input). The type name is historical.
 // Pure logic so the values are host tested (test/costean/test_board602.cpp).
 #include "tuning.h"
 

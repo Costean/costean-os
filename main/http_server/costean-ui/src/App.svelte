@@ -55,7 +55,7 @@
 <aside class="side" class:open={menu}>
   <a class="brand" href="#/dashboard">
     <svg viewBox="0 0 28 28" width="30" height="30" aria-hidden="true"><rect x="7" y="7" width="14" height="14" rx="2.5" transform="rotate(45 14 14)" fill="none" stroke="var(--acc)" stroke-width="2.6"/><path d="M10.5 17.5 17.5 10.5" stroke="var(--acc2)" stroke-width="2.6" stroke-linecap="round"/></svg>
-    <span><b>Costean <em>OS</em></b><i>BITAXE GAMMA 602 · BM1370</i></span></a>
+    <span><b>Costean <em>OS</em></b><i>BITAXE GAMMA 601/602 · BM1370</i></span></a>
   <div class="eyebrow navh">Your miner</div>
   <nav>{#each NAV as [id, label]}<a href="#/{id}" class:on={app.page === id} onclick={() => menu = false}><span class="ic">{ICON[id]}</span>{label}{#if id === 'block' && app.info?.blockFound > 0}<span class="nb" data-testid="nav-block-count">{app.info.blockFound}</span>{/if}</a>{/each}</nav>
   <div class="sp"></div>
@@ -68,9 +68,9 @@
     <button class="burger" onclick={() => menu = !menu} aria-label="Menu">☰</button>
     <div><div class="eyebrow" data-testid="fw-version">Costean OS {app.info?.version || ''} · control center</div><div class="ttl">{title}</div></div>
     <span class="sp"></span>
-    {#if app.costean?.status}{@const cs = app.costean.status}<a class="pill" href="#/tuning" data-testid="mode-pill"><span class="dot {cs.governor?.state === 'throttled' || cs.governor?.state === 'backed-off' ? 'warn' : 'ok'}"></span><b>{profileLabel(cs.activeProfile).toUpperCase()}</b>{cs.governor?.state === 'throttled' ? ' · THROTTLED' : ''} <span class="pill-op">· {cs.applied?.mhz} MHz / {cs.applied?.mv} mV</span></a>
+    {#if app.costean?.status}{@const cs = app.costean.status}{@const tu = cs.tuner}<a class="pill" href="#/tuning" data-testid="mode-pill"><span class="dot {cs.governor?.state === 'throttled' || cs.governor?.state === 'backed-off' || tu?.phase === 'trimming' ? 'warn' : 'ok'}"></span><b>{profileLabel(cs.activeProfile).toUpperCase()}</b>{cs.governor?.state === 'throttled' ? ' · THROTTLED' : tu?.enabled && tu.phase && tu.phase !== 'off' ? ' · ' + tu.phase.toUpperCase() : ''} <span class="pill-op">· {(tu?.enabled ? tu.trialMhz : cs.applied?.mhz)} MHz / {(tu?.enabled ? tu.trialMv : cs.applied?.mv)} mV</span></a>
     {:else if app.info}<span class="pill" data-testid="mode-pill">{app.info.frequency} MHz / {app.info.coreVoltage} mV</span>{/if}
-    {#if app.info}<span class="pill mono hide-s">{app.info.ASICModel || 'BM1370'} · {app.info.boardVersion || '602'}</span>{/if}
+    {#if app.info}<span class="pill mono hide-s">{app.info.ASICModel || 'BM1370'} · {app.info.boardVersion || '601/602'}</span>{/if}
   </header>
   <main>
     {#if app.demo}<div class="demo-banner" data-testid="demo">DEMO DATA — mock server, not a real miner</div>{/if}

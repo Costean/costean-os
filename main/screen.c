@@ -296,6 +296,7 @@ static void lode_fill_view(SystemModule * module, PowerManagementModule * pm)
     v->throttled = ci.throttled;
     v->scheduled = ci.scheduled;
     v->tune_steps = ci.tune_steps;
+    snprintf(v->tuner_line, sizeof(v->tuner_line), "%s", ci.tuner_line);
     v->lim_chip = ci.lim_chip; v->lim_vr = ci.lim_vr; v->lim_power = ci.lim_power;
     v->ghs = module->current_hashrate;
     v->mhz = (int) (pm->frequency_value + 0.5f);

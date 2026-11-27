@@ -32,7 +32,7 @@
 </script>
 <div class="card c-cyan" data-testid="manual-tuning">
   <h2>Mining &amp; Tuning · Manual</h2>
-  <p class="mute small">Stock for the Gamma 602 is 525 MHz at 1150 mV. Pick a common value or type your own: {r.minMhz}–{r.maxMhz} MHz and {r.minMv}–{r.maxMv} mV. Your values are saved on the miner and never overwritten by a profile, schedule or auto-tune.</p>
+  <p class="mute small">Stock for the Gamma 601/602 is 525 MHz at 1150 mV. Pick a common value or type your own: {r.minMhz}–{r.maxMhz} MHz and {r.minMv}–{r.maxMv} mV. Your values are saved on the miner and never overwritten by a profile, schedule or auto-tune.</p>
   {#if freq != null}
   <div class="tg">
     <div class="fbox">

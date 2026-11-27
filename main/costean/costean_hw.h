@@ -23,6 +23,7 @@ typedef struct {
     bool self_test;
     bool failover;       /* split failover or ESP-Miner fallback pool in use */
     int stock_mhz, stock_mv;   /* board defaults */
+    char board[12];      /* NVS board version, e.g. "601" or "602" */
     int user_mhz, user_mv;     /* saved settings (Manual) */
 } costean_hw_t;
 

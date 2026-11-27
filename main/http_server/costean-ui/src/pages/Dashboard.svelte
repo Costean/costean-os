@@ -4,7 +4,10 @@
   import Chart from '../components/Chart.svelte';
   import { app, runAction } from '../lib/store.svelte.js';
   import { api, fmtDiff, fmtUptime } from '../lib/api.js';
-  import { shortHost } from '../lib/costean.js';
+  import { shortHost, tunerPhase, TUNER_GOALS } from '../lib/costean.js';
+  let tu = $derived(app.costean?.status?.tuner);
+  let tp = $derived(tunerPhase(app.costean?.status));
+  const goalLabel = $derived((TUNER_GOALS.find(g => g.id === tu?.goal) || TUNER_GOALS[0]).label);
   const i = $derived(app.info || {});
   const gh = $derived(Number(i.hashRate) || 0);
   const expected = $derived(Number(i.expectedHashrate) || (i.frequency && i.smallCoreCount ? i.frequency * i.smallCoreCount / 1000 : 0));
@@ -35,6 +38,22 @@
   </div>
 </section>
 <CosteanStrip />
+
+{#if tu?.enabled}
+<section class="card c-cyan tuner-chip" data-testid="tuner-chip">
+  <div class="cell">
+    <div class="eyebrow">Auto-tune</div>
+    <div class="row"><span class="tag {tp.level === 'warn' ? 'warn' : 'ok'}">{tp.pill}</span><span class="mute small">{goalLabel}</span></div>
+  </div>
+  <div class="cell"><div class="eyebrow">Point</div><div class="big mono">{tu.trialMhz}<small> MHz</small></div><div class="mute small mono">{tu.trialMv} mV</div></div>
+  <div class="cell"><div class="eyebrow">Efficiency</div><div class="big mono" style="color:var(--acc2)">{tu.jth?.toFixed(1)}<small> J/TH</small></div><div class="mute small">{tu.ghs ? (tu.ghs / 1000).toFixed(2) + ' TH/s' : ''}</div></div>
+  <div class="cell grow"><div class="eyebrow">Best so far</div>
+    <div class="small">{#if tu.best}<b class="mono">{tu.best.mhz} MHz @ {tu.best.mv} mV</b> · {tu.best.jth?.toFixed(1)} J/TH{:else}Still searching{/if}</div>
+    <div class="mute small">{tu.note}</div>
+    <a class="mute small" href="#/tuning">Open Profiles &amp; Limits</a>
+  </div>
+</section>
+{/if}
 <section class="grid g2">
   <div class="card c-ice"><h2>Hash trend</h2><Chart height={190} unit="GH/s" series={[{ name: 'Hashrate', color: '#d9733a', points: rec.map(x => ({ t: x.t, v: x.gh })) }]} /></div>
   <div class="card c-blue"><h2>Temperatures</h2><Chart height={190} unit="°C" series={[{ name: 'Chip', color: '#f59e0b', points: rec.map(x => ({ t: x.t, v: x.chip })) }, { name: 'VR', color: '#3fd8c2', points: rec.map(x => ({ t: x.t, v: x.vr })) }]} /></div>
@@ -55,5 +74,6 @@
 .hero{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:14px}.gauge{display:grid;gap:6px}.status{border-top:1px solid var(--line);padding-top:10px}
 .vit{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .strip{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.strip>div{display:grid;gap:2px}.strip b{font-size:20px}
+.tuner-chip{display:flex;gap:24px;flex-wrap:wrap;align-items:end;text-decoration:none;color:inherit}.tuner-chip .cell{display:grid;gap:3px}.tuner-chip .grow{flex:1;min-width:220px}.tuner-chip .big small{font:600 13px var(--ui);color:var(--mute)}
 @media (max-width:1100px){.hero{grid-template-columns:1fr}.vit{grid-template-columns:repeat(2,1fr)}.strip{grid-template-columns:repeat(2,1fr)}}
 </style>

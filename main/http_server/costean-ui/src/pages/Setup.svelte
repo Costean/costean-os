@@ -89,7 +89,7 @@
 <div class="setup" data-testid="setup">
   <header>
     <svg viewBox="0 0 28 28" width="34" height="34" aria-hidden="true"><rect x="7" y="7" width="14" height="14" rx="2.5" transform="rotate(45 14 14)" fill="none" stroke="var(--acc)" stroke-width="2.6"/><path d="M10.5 17.5 17.5 10.5" stroke="var(--acc2)" stroke-width="2.6" stroke-linecap="round"/></svg>
-    <div><b class="brand">Costean <em>OS</em></b><div class="sub">BITAXE GAMMA 602 · SETUP</div></div>
+    <div><b class="brand">Costean <em>OS</em></b><div class="sub">BITAXE GAMMA 601/602 · SETUP</div></div>
   </header>
 
   {#if app.demo}<div class="demo-banner" data-testid="demo">DEMO DATA — mock server, not a real miner</div>{/if}

@@ -180,3 +180,22 @@ export function governorText(s) {
     default: return { level: 'ok', text: g.reason ? g.reason[0].toUpperCase() + g.reason.slice(1) : 'Holding target. Headroom OK.' };
   }
 }
+
+/** Auto-tune searcher phase label and colour for the Lode UI. */
+export const TUNER_GOALS = [
+  { id: 'efficiency', label: 'Best efficiency', blurb: 'Holds voltage, climbs only while J/TH keeps falling, then trims voltage down.' },
+  { id: 'hashrate', label: 'Most hashrate', blurb: 'Climbs until a heat, power or error wall, then trims voltage down.' },
+  { id: 'power', label: 'Hashrate under a power cap', blurb: 'Same climb, but stops before your power cap (measured at the 5 V input).' },
+];
+export function tunerPhase(st) {
+  const t = st?.tuner;
+  if (!t || !t.enabled) return { id: 'off', pill: 'OFF', level: 'mute', text: 'Auto-tune is off' };
+  const map = {
+    searching: { pill: 'SEARCHING', level: 'ok', text: 'Measuring a candidate point' },
+    trimming: { pill: 'TRIMMING', level: 'warn', text: 'Lowering voltage at the best clock' },
+    locked: { pill: 'LOCKED', level: 'ok', text: 'Stable point found' },
+    watching: { pill: 'WATCHING', level: 'ok', text: 'Re-checking the locked point' },
+    backoff: { pill: 'BACKING OFF', level: 'warn', text: 'The last point was not stable' },
+  };
+  return { id: t.phase || 'off', ...(map[t.phase] || { pill: String(t.phase || 'OFF').toUpperCase(), level: 'mute', text: '' }) };
+}

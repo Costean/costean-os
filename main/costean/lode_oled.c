@@ -223,7 +223,8 @@ static void page_hash(lode_fb_t *fb, const lode_view_t *v, bool blink)
     big(fb, 0, 9, num);
     txt(fb, lode_big_width(num) + 4, 16, unit);
     char l[24], t[8];
-    snprintf(l, sizeof l, "%dMHz %dmV", v->mhz, v->mv);
+    if (v->tuner_line[0]) snprintf(l, sizeof l, "%s", v->tuner_line);
+    else snprintf(l, sizeof l, "%dMHz %dmV", v->mhz, v->mv);
     snprintf(t, sizeof t, "%dC", (int) (v->chip_c + 0.5f));
     txt(fb, 0, 25, l);
     if (lode_text_width(l, 1) + lode_text_width(t, 1) + 6 <= LODE_W) rtxt(fb, 25, t);
@@ -241,7 +242,9 @@ static void heat_line(lode_fb_t *fb, int y, const char *label, float val, int li
 
 static void page_heat(lode_fb_t *fb, const lode_view_t *v, bool blink)
 {
-    header(fb, v, "HEAT", tag_for(v, blink));
+    const char *htag = tag_for(v, blink);
+    if (!htag && v->tuner_line[0]) htag = v->tuner_line;
+    header(fb, v, "HEAT", htag);
     heat_line(fb, 8, "CHIP", v->chip_c, v->lim_chip, "C", 0);
     heat_line(fb, 16, "VR", v->vr_c, v->lim_vr, "C", 0);
     heat_line(fb, 24, "POWER", v->power_w, v->lim_power, "W", 1);

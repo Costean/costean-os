@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 #include "costean_hw.h"
 
 #include <math.h>
@@ -30,6 +31,8 @@ void costean_hw_read(costean_hw_t *o)
     o->failover = pool_split_failover_active() || (!pool_split_is_active() && sm->is_using_fallback);
     o->stock_mhz = G->DEVICE_CONFIG.family.asic.default_frequency_mhz;
     o->stock_mv = G->DEVICE_CONFIG.family.asic.default_voltage_mv;
+    snprintf(o->board, sizeof o->board, "%s",
+             G->DEVICE_CONFIG.board_version ? G->DEVICE_CONFIG.board_version : "");
     o->user_mhz = (int) lroundf(nvs_config_get_float(NVS_CONFIG_ASIC_FREQUENCY));
     o->user_mv = (int) nvs_config_get_u16(NVS_CONFIG_ASIC_VOLTAGE);
 }

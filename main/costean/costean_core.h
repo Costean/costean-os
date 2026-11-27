@@ -1,5 +1,5 @@
 #pragma once
-/* Costean OS 1.2 runtime for the Bitaxe Gamma 602: tuning profiles, safety governor, optional
+/* Costean OS 1.2 runtime for the Bitaxe Gamma 601/602: tuning profiles, safety governor, optional
  * auto-tune, weekly schedules (profile + screen) and the 48 h history kept in flash.
  * ESP-IDF glue around the host-tested logic in tuning / scheduler / rollup / board602. */
 #include <stdbool.h>
@@ -17,6 +17,7 @@ typedef struct {
     bool throttled;
     bool scheduled;       /* a schedule window chose the profile */
     int tune_steps;
+    char tuner_line[20];  /* "" when auto-tune is off, else "LOCK 575/1100" or "TUNE 550/1150" */
     int lim_chip, lim_vr, lim_power;
     uint8_t screen_mode;  /* 0 normal, 1 dim, 2 off */
 } costean_screen_info_t;

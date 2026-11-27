@@ -1,4 +1,4 @@
-// Bitaxe Gamma 602 values: profiles, limits and the governor at the 602's own operating points.
+// Bitaxe Gamma 601/602 values: profiles, limits and the governor at the Gamma stock operating points.
 #include "check.h"
 #include <string.h>
 #include "../../main/costean/board602.h"

@@ -1,4 +1,4 @@
-// Costean OS (Bitaxe Gamma 602) screenshots, smoke checks and a demo click-through against the DEMO mock (never a real miner).
+// Costean OS (Bitaxe Gamma 601/602) screenshots, smoke checks and a demo click-through against the DEMO mock (never a real miner).
 import { chromium } from '/node_modules/playwright-core/index.mjs';
 import { spawn } from 'node:child_process'; import fs from 'node:fs';
 const OUT = process.env.SCREENS || 'screens'; fs.mkdirSync(OUT, { recursive: true });

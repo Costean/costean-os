@@ -19,3 +19,20 @@ describe('manual tuning range', () => {
   });
   it('hashrate estimate', () => expect(estThs(950)).toBeCloseTo(1.94, 2));
 });
+
+import { TUNER_GOALS, tunerPhase } from '../src/lib/costean.js';
+describe('auto-tune searcher UI helpers', () => {
+  it('lists the three goals, defaulting to best efficiency', () => {
+    expect(TUNER_GOALS.map(g => g.id)).toEqual(['efficiency', 'hashrate', 'power']);
+    expect(TUNER_GOALS[0].id).toBe('efficiency');
+  });
+  it('maps searcher phases to Lode pills', () => {
+    expect(tunerPhase({}).id).toBe('off');
+    expect(tunerPhase({ tuner: { enabled: false } }).pill).toBe('OFF');
+    expect(tunerPhase({ tuner: { enabled: true, phase: 'searching' } }).pill).toBe('SEARCHING');
+    expect(tunerPhase({ tuner: { enabled: true, phase: 'trimming' } }).pill).toBe('TRIMMING');
+    expect(tunerPhase({ tuner: { enabled: true, phase: 'locked' } }).pill).toBe('LOCKED');
+    expect(tunerPhase({ tuner: { enabled: true, phase: 'watching' } }).pill).toBe('WATCHING');
+    expect(tunerPhase({ tuner: { enabled: true, phase: 'backoff' } }).pill).toBe('BACKING OFF');
+  });
+});

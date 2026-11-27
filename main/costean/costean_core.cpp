@@ -46,6 +46,7 @@ bool s_cfgDirty = false;
 bool s_cfgLoaded = false;
 Presets s_presets;
 Governor s_gov;
+Searcher s_search;
 Rollup s_roll;
 ScheduleResult s_sched;
 Profile s_active = Profile::CUSTOM;
@@ -109,6 +110,14 @@ cJSON *cfgToJson(const Cfg &c)
     cJSON_AddNumberToObject(a, "maxErrorPct", c.autotune.maxErrorPct);
     cJSON_AddNumberToObject(a, "maxRejectPct", c.autotune.maxRejectPct);
     cJSON_AddNumberToObject(a, "holdMin", (int) (c.autotune.holdMs / 60000));
+    cJSON_AddStringToObject(a, "goal", tuneGoalName(c.autotune.goal));
+    if (c.autotune.powerCapW > 0) cJSON_AddNumberToObject(a, "powerCap", c.autotune.powerCapW);
+    if (c.autotune.lockedMhz > 0) {
+        cJSON_AddNumberToObject(a, "lockedMhz", c.autotune.lockedMhz);
+        cJSON_AddNumberToObject(a, "lockedMv", c.autotune.lockedMv);
+        cJSON_AddNumberToObject(a, "lockedGhs", c.autotune.lockedGhs);
+        cJSON_AddNumberToObject(a, "lockedJth", c.autotune.lockedJth);
+    }
     cJSON *pf = cJSON_AddObjectToObject(o, "profiles");
     for (int i = 0; i < kEditProfiles; i++) {
         const ProfileEdit &e = c.prof[i];
@@ -242,6 +251,17 @@ const char *cfgFromJson(Cfg &c, const cJSON *o, bool lenient = false)
         if ((v = get(a, "maxErrorPct"))) { if (!cJSON_IsNumber(v) || v->valuedouble < 0.2 || v->valuedouble > 3) return "error ceiling must be 0.2-3 %"; c.autotune.maxErrorPct = (float) v->valuedouble; }
         if ((v = get(a, "maxRejectPct"))) { if (!cJSON_IsNumber(v) || v->valuedouble < 0.2 || v->valuedouble > 5) return "reject ceiling must be 0.2-5 %"; c.autotune.maxRejectPct = (float) v->valuedouble; }
         if ((v = get(a, "holdMin"))) { if (!isInt(v) || v->valueint < 5 || v->valueint > 120) return "dwell must be 5-120 min"; c.autotune.holdMs = (uint32_t) v->valueint * 60000u; }
+        if ((v = get(a, "goal"))) {
+            if (!cJSON_IsString(v)) return "autotune.goal must be a string";
+            c.autotune.goal = tuneGoalFromName(v->valuestring);
+        }
+        if ((v = get(a, "powerCap"))) {
+            if (!isInt(v) || v->valueint < Board602::kPowerMin || v->valueint > Board602::kPsuMax)
+                return "power cap must be 10-150 W";
+            int psu = psu602(c.limits);
+            if (v->valueint > psu) return "power cap cannot exceed the supply rating";
+            c.autotune.powerCapW = v->valueint;
+        }
     }
     const cJSON *s = get(o, "schedule");
     if (s) {
@@ -358,7 +378,16 @@ void setupBoard()
     setupBoard602(s_hw.stock_mhz, s_hw.stock_mv, s_hw.user_mhz, s_hw.user_mv, e, s_presets, defaults);
     applyProfileEdits602(s_presets, s_cfg.prof);
     if (!s_cfgLoaded) { s_cfg.limits = defaults; }
-    s_gov.configure(e, effectiveLimits602(s_cfg.limits), s_cfg.autotune);
+    s_gov.configure(e, effectiveLimits602(s_cfg.limits), AutoTune{});   // Governor is safety only; the searcher owns auto-tune
+    SearchConfig sc;
+    sc.enabled = s_cfg.autotune.enabled;
+    sc.goal = s_cfg.autotune.goal;
+    sc.powerCapW = s_cfg.autotune.powerCapW;
+    sc.maxErrorPct = s_cfg.autotune.maxErrorPct;
+    sc.maxRejectPct = s_cfg.autotune.maxRejectPct;
+    s_search.configure(e, effectiveLimits602(s_cfg.limits), sc);
+    if (s_cfg.autotune.lockedMhz > 0)
+        s_search.setLock({s_cfg.autotune.lockedMhz, s_cfg.autotune.lockedMv, s_cfg.autotune.lockedGhs, s_cfg.autotune.lockedJth});
 }
 
 // ---------- SNTP: schedules need wall-clock time ----------
@@ -391,6 +420,7 @@ void readTelemetry()
         s_snapT = now; s_snapAcc = a; s_snapRej = r;
     }
     t.rejectPct = s_rejPct;
+    t.ghs = s_hw.ghs > 0 ? s_hw.ghs : 0;
     s_tel = t;
 }
 
@@ -407,6 +437,9 @@ void step()
         s_cfg.profile = Profile::CUSTOM;
         s_cfg.autotune.enabled = false;
         s_gov.resetTune();
+        s_search.restart();
+        s_cfg.autotune.lockedMhz = s_cfg.autotune.lockedMv = 0;
+        s_cfg.autotune.lockedGhs = s_cfg.autotune.lockedJth = 0;
         s_cfgDirty = true;
     }
     s_overheatSeen = overheat;
@@ -418,11 +451,30 @@ void step()
         Envelope e; Limits unused;
         setupBoard602(s_hw.stock_mhz, s_hw.stock_mv, uM, uV, e, s_presets, unused);
         applyProfileEdits602(s_presets, s_cfg.prof);   // the user's own profile values
-        s_gov.configure(e, effectiveLimits602(s_cfg.limits), s_cfg.autotune);
+        Limits el = effectiveLimits602(s_cfg.limits);
+        s_gov.configure(e, el, AutoTune{});   // throttle only; the searcher owns climbing and trimming
+        SearchConfig sc;
+        sc.enabled = s_cfg.autotune.enabled;
+        sc.goal = s_cfg.autotune.goal;
+        sc.powerCapW = s_cfg.autotune.powerCapW;
+        sc.maxErrorPct = s_cfg.autotune.maxErrorPct;
+        sc.maxRejectPct = s_cfg.autotune.maxRejectPct;
+        s_search.configure(e, el, sc);
         s_sched = s_cfg.schedule.enabled ? s_cfg.schedule.evaluate(utc, zone()) : ScheduleResult();
         s_active = s_sched.profile != Profile::NONE && profileAvailable(s_sched.profile, s_cfg.prof) ? s_sched.profile : s_cfg.profile;
         s_target = s_presets.of(s_active);
-        out = s_gov.step(s_target, s_tel, now);
+        bool throttled = s_gov.throttleSteps() > 0;
+        OpPoint want = s_search.step(s_target, s_tel, now, throttled);
+        if (s_search.lockDirty()) {
+            SearchLock L = s_search.lock();
+            s_cfg.autotune.lockedMhz = L.mhz;
+            s_cfg.autotune.lockedMv = L.mv;
+            s_cfg.autotune.lockedGhs = L.ghs;
+            s_cfg.autotune.lockedJth = L.jth;
+            s_search.clearLockDirty();
+            s_cfgDirty = true;
+        }
+        out = s_gov.step(want, s_tel, now);
     }
     // Apply: when the clock goes down, lower it first and the voltage on the next tick.
     // (Going up, the power task already sets the voltage before the clock.)
@@ -535,6 +587,12 @@ void costean_screen_info(costean_screen_info_t *o)
     o->throttled = s_gov.throttleSteps() > 0;
     o->scheduled = s_sched.profileWindow >= 0;
     o->tune_steps = s_gov.tuneSteps();
+    o->tuner_line[0] = 0;
+    if (s_search.enabled() && s_search.phase() != SearchPhase::OFF) {
+        OpPoint tr = s_search.trial();
+        const char *tag = (s_search.phase() == SearchPhase::LOCKED || s_search.phase() == SearchPhase::WATCHING) ? "LOCK" : "TUNE";
+        snprintf(o->tuner_line, sizeof o->tuner_line, "%s %d/%d", tag, tr.mhz, tr.mv);
+    }
     Limits lim = effectiveLimits602(s_cfg.limits);
     o->lim_chip = lim.chipTempC; o->lim_vr = lim.vrTempC; o->lim_power = lim.powerW;
     o->screen_mode = costean_screen_mode();
@@ -544,7 +602,7 @@ cJSON *costean_status_json(void)
 {
     Lock l;
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "board", "602");
+    cJSON_AddStringToObject(o, "board", s_hw.board[0] ? s_hw.board : "unknown");
     cJSON_AddStringToObject(o, "activeProfile", profileName(s_active));
     cJSON_AddStringToObject(o, "profileSource", s_sched.profile != Profile::NONE ? "schedule" : "user");
     addPoint(o, "target", s_target);
@@ -620,6 +678,37 @@ cJSON *costean_status_json(void)
     cJSON *zs = cJSON_AddArrayToObject(o, "zones");
     for (int i = 0; zoneAt(i); i++) cJSON_AddItemToArray(zs, cJSON_CreateString(zoneAt(i)->id));
     cJSON_AddBoolToObject(o, "failover", s_failover);
+    cJSON *tu = cJSON_AddObjectToObject(o, "tuner");
+    cJSON_AddBoolToObject(tu, "enabled", s_search.enabled());
+    cJSON_AddStringToObject(tu, "goal", tuneGoalName(s_cfg.autotune.goal));
+    if (s_cfg.autotune.goal == TuneGoal::POWER_CAP || s_cfg.autotune.powerCapW > 0)
+        cJSON_AddNumberToObject(tu, "powerCap", s_search.powerCapW());
+    cJSON_AddStringToObject(tu, "phase", searchPhaseName(s_search.phase()));
+    cJSON_AddNumberToObject(tu, "trialMhz", s_search.trial().mhz);
+    cJSON_AddNumberToObject(tu, "trialMv", s_search.trial().mv);
+    cJSON_AddNumberToObject(tu, "jth", s_search.liveJth());
+    cJSON_AddNumberToObject(tu, "ghs", s_search.liveGhs());
+    cJSON_AddNumberToObject(tu, "progress", s_search.progress());
+    cJSON_AddStringToObject(tu, "note", s_search.note());
+    if (s_search.best().valid()) {
+        cJSON *b = cJSON_AddObjectToObject(tu, "best");
+        cJSON_AddNumberToObject(b, "mhz", s_search.best().mhz);
+        cJSON_AddNumberToObject(b, "mv", s_search.best().mv);
+        cJSON_AddNumberToObject(b, "ghs", s_search.best().ghs);
+        cJSON_AddNumberToObject(b, "jth", s_search.best().jth);
+    }
+    if (s_search.logCount() > 0) {
+        cJSON *stps = cJSON_AddArrayToObject(tu, "steps");
+        for (int i = 0; i < s_search.logCount(); i++) {
+            const SearchStep &e = s_search.logAt(i);
+            cJSON *j = cJSON_CreateObject();
+            cJSON_AddNumberToObject(j, "mhz", e.mhz);
+            cJSON_AddNumberToObject(j, "mv", e.mv);
+            cJSON_AddNumberToObject(j, "jth", e.jth);
+            cJSON_AddStringToObject(j, "result", e.result);
+            cJSON_AddItemToArray(stps, j);
+        }
+    }
     costean_hw_split_json(o);
     return o;
 }
@@ -659,9 +748,18 @@ const char *costean_patch_config(const cJSON *body)
     const char *err = cfgFromJson(c, body);
     if (err) return err;
     bool tuneWasOn = s_cfg.autotune.enabled;
+    Profile oldProf = s_cfg.profile;
+    TuneGoal oldGoal = s_cfg.autotune.goal;
+    int oldCap = s_cfg.autotune.powerCapW;
     s_cfg = c;
     const cJSON *a = get(body, "autotune");
+    bool restart = cJSON_IsTrue(get(a, "reset")) || cJSON_IsTrue(get(a, "restart"));
     if (cJSON_IsTrue(get(a, "reset"))) s_gov.resetTune();
+    if (restart || oldProf != s_cfg.profile || oldGoal != s_cfg.autotune.goal || oldCap != s_cfg.autotune.powerCapW) {
+        s_search.restart();
+        s_cfg.autotune.lockedMhz = s_cfg.autotune.lockedMv = 0;
+        s_cfg.autotune.lockedGhs = s_cfg.autotune.lockedJth = 0;
+    }
     if (tuneWasOn != s_cfg.autotune.enabled) ESP_LOGW(TAG, "auto-tune %s", s_cfg.autotune.enabled ? "ENABLED" : "disabled");
     s_cfgDirty = true;
     return nullptr;
