@@ -24,7 +24,7 @@ static inline wifi_fail_t wifi_fail_classify(int reason)
         return WIFI_FAIL_NOT_FOUND;
     case 210: case 211: case 18: case 19: case 20: case 21: case 22: case 23: case 24: case 29:
         return WIFI_FAIL_SECURITY;
-    case 202: case 5: case 6: case 7: case 9: case 30: case 49:
+    case 202: case 5: case 6: case 7: case 9: case 30: case 49:   // 202 = AUTH_FAIL: not proof of a wrong password
         return WIFI_FAIL_AUTH;
     case 200: case 203: case 205: case 4: case 34: case 39: case 208: case 209:
         return WIFI_FAIL_WEAK_SIGNAL;
@@ -54,7 +54,7 @@ static inline const char *wifi_fail_hint(wifi_fail_t f)
     case WIFI_FAIL_WRONG_PASSWORD: return "The router rejected the password. Passwords are case-sensitive.";
     case WIFI_FAIL_NOT_FOUND: return "The miner cannot see this network. It only uses 2.4 GHz; check the name and move it closer.";
     case WIFI_FAIL_SECURITY: return "The network uses a security mode the miner cannot join (WPA3-only, Enterprise or WEP). Enable WPA2 or WPA2/WPA3 mixed mode on the router.";
-    case WIFI_FAIL_AUTH: return "The router refused the connection. Check MAC filtering or the client limit.";
+    case WIFI_FAIL_AUTH: return "The router refused the login (error 202 is often a WPA3 handshake problem, not the password). Try again close to the router; if it keeps failing, set the router to WPA2 or WPA2/WPA3 mixed, and check MAC filtering or the client limit.";
     case WIFI_FAIL_WEAK_SIGNAL: return "The connection timed out. Move the miner closer to the router.";
     case WIFI_FAIL_NO_IP: return "Joined the network but the router did not hand out an IP address (DHCP).";
     case WIFI_FAIL_OTHER: return "The connection failed. Try again, or restart the router.";

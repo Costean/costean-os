@@ -100,6 +100,7 @@ REQUIRES
 
 PRIV_REQUIRES
     "app_update"
+    "espcoredump"
     "esp_adc"
     "esp_app_format"
     "esp_driver_gpio"

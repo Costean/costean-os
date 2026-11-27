@@ -92,7 +92,7 @@ static void wifi_failures(void)
     CHECK(wifi_fail_classify(201) == WIFI_FAIL_NOT_FOUND);
     CHECK(wifi_fail_classify(210) == WIFI_FAIL_SECURITY);
     CHECK(wifi_fail_classify(211) == WIFI_FAIL_SECURITY);
-    CHECK(wifi_fail_classify(202) == WIFI_FAIL_AUTH);
+    CHECK(wifi_fail_classify(202) == WIFI_FAIL_AUTH);   // AUTH_FAIL: router refused the login (often WPA3/SAE), not proof of a wrong password
     CHECK(wifi_fail_classify(200) == WIFI_FAIL_WEAK_SIGNAL);
     CHECK(wifi_fail_classify(0) == WIFI_FAIL_NONE);
     CHECK(wifi_fail_classify(8) == WIFI_FAIL_OTHER);

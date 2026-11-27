@@ -50,6 +50,8 @@
 #include "websocket_api.h"
 #include "system_api_json.h"
 #include "log_buffer.h"
+#include "esp_core_dump.h"
+#include "esp_partition.h"
 #include "cjson_utils.h"
 #include "utils.h"
 
@@ -156,6 +158,35 @@ static esp_err_t GET_system_logs(httpd_req_t *req)
         res = httpd_resp_send_chunk(req, NULL, 0);
     }
 
+    return res;
+}
+
+/* Costean OS costean.8: download the crash dump that the panic handler saved in the "coredump" partition, so a
+ * reboot loop can be diagnosed without a serial cable (decode with esp-coredump and the matching .elf).
+ * GET /api/system/coredump -> application/octet-stream, 404 when no valid dump is stored. Read-only. */
+static esp_err_t GET_system_coredump(httpd_req_t *req)
+{
+    if (is_network_allowed(req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+    }
+    size_t addr = 0, size = 0;
+    const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+    if (part == NULL || esp_core_dump_image_get(&addr, &size) != ESP_OK || size == 0 || addr < part->address ||
+        addr + size > part->address + part->size) {
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No crash dump stored");
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"bitaxe-coredump.bin\"");
+    char *buf = malloc(2048);
+    if (buf == NULL) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
+    esp_err_t res = ESP_OK;
+    for (size_t off = 0; off < size && res == ESP_OK; off += 2048) {
+        size_t n = size - off < 2048 ? size - off : 2048;
+        res = esp_partition_read(part, addr - part->address + off, buf, n);
+        if (res == ESP_OK) res = httpd_resp_send_chunk(req, buf, n);
+    }
+    free(buf);
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, NULL, 0);
     return res;
 }
 
@@ -2331,6 +2362,14 @@ esp_err_t start_rest_server(GlobalState * global_state)
         .user_ctx = rest_context
     };
     httpd_register_uri_handler(server, &system_logs_get_uri);
+
+    httpd_uri_t system_coredump_get_uri = {
+        .uri = "/api/system/coredump",
+        .method = HTTP_GET,
+        .handler = GET_system_coredump,
+        .user_ctx = rest_context
+    };
+    httpd_register_uri_handler(server, &system_coredump_get_uri);
 
     httpd_uri_t system_identify_uri = {
         .uri = "/api/system/identify", .method = HTTP_POST, 

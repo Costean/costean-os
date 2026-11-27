@@ -42,6 +42,22 @@ static const char * TAG = "bitaxe";
 #define DEFAULT_GPIO_I2C_SDA CONFIG_GPIO_I2C_SDA
 #define DEFAULT_GPIO_I2C_SCL CONFIG_GPIO_I2C_SCL
 
+#ifdef CONFIG_COSTEAN_STACK_WATCH
+#include "esp_timer.h"
+static void costean_stack_watch_task(void *arg)
+{
+    static TaskStatus_t st[48];
+    while (1) {
+        UBaseType_t n = uxTaskGetSystemState(st, 48, NULL);
+        printf("STACKWATCH t=%llds heap_int=%u heap_min_int=%u wifi='%s' link=%d phase=%d\n", esp_timer_get_time() / 1000000,
+               (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+               GLOBAL_STATE.SYSTEM_MODULE.wifi_status, (int) wifi_link_state(), (int) boot_guard_phase());
+        for (UBaseType_t i = 0; i < n; i++) printf("  STACKWATCH %-16s free=%u\n", st[i].pcTaskName, (unsigned) st[i].usStackHighWaterMark);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+#endif
+
 static void heap_alloc_failed_hook(size_t requested_size, uint32_t caps, const char *function_name)
 {
     if (caps & MALLOC_CAP_SPIRAM) {
@@ -90,6 +106,9 @@ void app_main(void)
     }
 #endif
   
+#ifdef CONFIG_COSTEAN_STACK_WATCH
+    xTaskCreate(costean_stack_watch_task, "stackwatch", 4096, NULL, 1, NULL);
+#endif
     // Initialize RST pin to low early to minimize ASIC power consumption
     ESP_ERROR_CHECK(asic_hold_reset_low());
     ESP_LOGI(TAG, "RST pin initialized to low");

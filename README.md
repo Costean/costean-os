@@ -3,15 +3,31 @@
 > [!WARNING]
 > **For the Bitaxe Gamma 602 only (1x BM1370, ESP32-S3, 16 MB flash).** Do not flash it on any other board.
 >
+> **1.2.0-costean.8 is EXPERIMENTAL. It has only been tested on a computer (host tests and builds) and has not yet run on a real miner.** costean.7 was withdrawn after it crashed on a real Gamma 602.
+>
 > **Not tested on hardware. Flash at your own risk.** The pool split, Discord alerts and schedules were tested only against fake Stratum pools and demo data. Keep the official recovery image handy (see [Recovery](#recover-to-official-esp-miner-v2154)).
 
 Costean OS is a custom firmware for the Bitaxe Gamma 602. (A *costean*, pronounced COS-teen, is an old mining word for a trench dug to find the lode.) It is a source fork of the official [bitaxeorg/ESP-Miner](https://github.com/bitaxeorg/ESP-Miner) **v2.15.4** (GPL-3.0) with a new web UI and extra firmware features written in C.
 
-Version: **1.2.0-costean.7** (Costean OS 1.2, same feature set as Costean OS 1.2 on the NerdOctAxe, scaled for one BM1370), built from **bitaxeorg/ESP-Miner v2.15.4** with **ESP-IDF v6.0.3**.
+Version: **1.2.0-costean.8 (experimental)** (Costean OS 1.2, same feature set as Costean OS 1.2 on the NerdOctAxe, scaled for one BM1370), built from **bitaxeorg/ESP-Miner v2.15.4** with **ESP-IDF v6.0.3**.
 
 ![Dashboard](docs/screenshots/web-01-dashboard.png)
 
-## New in 1.2.0-costean.7: clean Wi-Fi setup on a fresh miner, crash dump
+## New in 1.2.0-costean.8 (experimental): Wi-Fi join with the hotspot off, crash dump download
+
+> [!CAUTION]
+> **Experimental build, not yet run on a real miner.** It is published so it can be tried on hardware. If it misbehaves, reflash a factory image or another firmware (see [Recovery](#recover-to-official-esp-miner-v2154)).
+
+- **costean.7 was withdrawn.** On a real Gamma 602 it crashed and restarted while joining Wi-Fi, landed in safe mode and showed error 202. Other firmware joined the same network with the same password on the same miner, so the problem is in this firmware, not the miner, the power supply or the password.
+- **Joining a saved network with the setup hotspot off.** With a Wi-Fi network saved, the miner now joins with the radio in station mode only: no `Bitaxe_XXXX` hotspot is running and no phone or captive-portal traffic competes with the router handshake. The radio mode is never changed inside the Wi-Fi event handler any more.
+- **The hotspot comes back after 90 s.** If the saved network cannot be joined for 90 seconds, the `Bitaxe_XXXX` setup hotspot comes back (joining keeps retrying in the background), so you can fix the password from your phone. With no network saved, the hotspot starts right away as before.
+- **Larger task stacks.** The Wi-Fi control task and the boot-guard task now have 6 KB of stack, and the FreeRTOS timer task 4 KB. The IP-address timeout no longer does its work inside the timer task.
+- **Crash dump you can download.** The crash dump in the 64 KB `coredump` partition (0xf12000) is kept, and you can now download it from the miner at `http://YOUR-BITAXE-IP/api/system/coredump` (or `http://192.168.4.1/api/system/coredump` on the hotspot). It returns 404 when no crash has been saved. Please attach it to a bug report.
+- **Error 202 label.** Error 202 now reads *Router refused the miner*, and the hint explains that it is often a WPA3 handshake problem rather than a wrong password. If it keeps happening, set the router to WPA2 or WPA2/WPA3 mixed.
+
+## 1.2.0-costean.7 (withdrawn): clean Wi-Fi setup on a fresh miner, crash dump
+
+costean.7 is no longer offered for download because it crashed on a real miner. Its changes below are all kept in costean.8.
 
 - **Fixed: a freshly flashed miner thought a network called `myssid` was saved.** The factory settings store an empty Wi-Fi name and password, and the settings loader replaces an empty value with the built-in default, which was the upstream placeholder `myssid` / `mypassword`. So a new miner kept trying to join `myssid`, and the setup page could say *Couldn't join "myssid"*. The defaults are now empty, so a fresh miner simply waits for you to pick a network.
 - **Fixed: an open network (no password) could stop working after a restart.** The empty password came back as `mypassword`, so the miner tried WPA2 on an open network. Same fix.
@@ -43,7 +59,7 @@ Version: **1.2.0-costean.7** (Costean OS 1.2, same feature set as Costean OS 1.2
 ![Setup: still joining, no need to re-enter the password](docs/screenshots/setup-06-joining.png)
 ![Safe mode banner](docs/screenshots/safe-mode-dashboard.png)
 
-- **Recovering a miner that keeps restarting:** flash `esp-miner-factory-602-v1.2.0-costean.7.bin` at **0x0** over USB (see Flashing). This resets all settings.
+- **Recovering a miner that keeps restarting:** flash `esp-miner-factory-602-v1.2.0-costean.8.bin` at **0x0** (or the official factory image or another firmware) over USB (see Flashing). This resets all settings.
   - The first boot after a factory flash runs the built-in **self-test**. If it passes, the miner restarts by itself after about 10 s. If it fails, the screen says so; **hold the BOOT button for 2 seconds** to cancel it.
   - Then join the `Bitaxe_XXXX` hotspot, pick your network and enter the password once.
   - If a miner that is already on costean.6 or later lands in safe mode, open its address and press **Restart normally**.
@@ -157,7 +173,7 @@ Get the files from the [Releases](../../releases) page.
 
 | File | What it is |
 |------|------------|
-| `esp-miner-factory-602-v1.2.0-costean.7.bin` | Full factory image (bootloader, partition table, official 602 NVS defaults, firmware, otadata). Flash at **0x0**. **This wipes all settings.** |
+| `esp-miner-factory-602-v1.2.0-costean.8.bin` | Full factory image (bootloader, partition table, official 602 NVS defaults, firmware, otadata). Flash at **0x0**. **This wipes all settings.** |
 | `esp-miner.bin` | OTA app image. Keeps your settings. The Costean web UI is built in. |
 | `www.bin` | Optional SPIFFS web UI partition (3 MB), only for the custom-WWW option. Not needed for normal installs. |
 | `SHA256SUMS` | SHA-256 of each file. Check it with `sha256sum -c SHA256SUMS`. |
@@ -173,12 +189,12 @@ Hold the BOOT button if the board is not already in download mode. Replace `PORT
 ```bash
 esptool --chip esp32s3 -p PORT -b 460800 --before default-reset --after hard-reset \
   write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m \
-  0x0 esp-miner-factory-602-v1.2.0-costean.7.bin
+  0x0 esp-miner-factory-602-v1.2.0-costean.8.bin
 ```
 
 You can also use [esptool-js](https://espressif.github.io/esptool-js/) and flash the factory file at address `0x0`.
 
-After a factory flash the miner starts its setup hotspot (`Bitaxe_XXXX`). Join it with your phone; the setup page opens by itself (if not, open `http://192.168.4.1`). Tap your Wi-Fi, enter the password and save. Then set your pool again. The default pool is the official ESP-Miner default (public-pool.io), so set your own pool right away.
+After a factory flash the miner starts its setup hotspot (`Bitaxe_XXXX`) (on costean.8 the hotspot stays off while a saved network is being joined, and comes back after 90 s without Wi-Fi). Join it with your phone; the setup page opens by itself (if not, open `http://192.168.4.1`). Tap your Wi-Fi, enter the password and save. Then set your pool again. The default pool is the official ESP-Miner default (public-pool.io), so set your own pool right away.
 
 ### Option B: OTA update (keeps settings)
 
@@ -197,6 +213,8 @@ curl -X POST --data-binary @www.bin http://YOUR-BITAXE-IP/api/system/OTAWWW
 After flashing, check that hashrate, temperatures and fan look normal before you turn on the pool split.
 
 ## Recover to official ESP-Miner v2.15.4
+
+If costean.8 misbehaves, flash a factory image at `0x0` over USB: the official one below, or any other firmware made for the Gamma 602. A factory flash wipes all settings.
 
 Costean OS does not re-host the official binaries. Download them from the official release: <https://github.com/bitaxeorg/ESP-Miner/releases/tag/v2.15.4>
 

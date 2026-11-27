@@ -135,7 +135,7 @@ void boot_guard_start_stable_timer(void)
     static bool started;
     if (started) return;
     started = true;
-    if (xTaskCreate(stable_task, "boot guard", 3072, NULL, 2, NULL) != pdPASS) ESP_LOGE(TAG, "stable task failed");
+    if (xTaskCreate(stable_task, "boot guard", 6144, NULL, 2, NULL) != pdPASS) ESP_LOGE(TAG, "stable task failed");
 }
 
 bool boot_guard_safe_mode(void) { return s_st.safe; }

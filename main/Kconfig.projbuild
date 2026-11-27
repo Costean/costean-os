@@ -207,6 +207,13 @@ menu "Stratum Configuration"
         help
             A starting difficulty to use with the fallback pool.
 
+    config COSTEAN_STACK_WATCH
+        bool "Costean debug: log free stack of every task every 5 s"
+        default n
+        help
+            Debug builds only. Prints the stack high-water mark of each task and the Wi-Fi state every 5 s,
+            so a stack overflow can be spotted on the serial log before it happens.
+
     config ENABLE_TASK_MONITOR
         bool "Task Monitor"
         default n

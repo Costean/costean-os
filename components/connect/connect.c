@@ -79,7 +79,11 @@ static bool mdns_init_in_progress = false;
 static volatile wifi_link_t s_link = WIFI_LINK_IDLE;
 static volatile int s_last_reason = 0;            // last disconnect reason (0 = none since the last success)
 static volatile wifi_fail_t s_last_fail = WIFI_FAIL_NONE;
-static volatile bool s_ip_timed_out = false;      // our own disconnect after the DHCP timeout
+static volatile bool s_ip_timed_out = false;
+static volatile bool s_ip_timeout_pending = false;   // costean.8: set by the timer, handled by the wifi ctl task
+static volatile int64_t s_down_since_us = 0;      // costean.8: saved network not reachable since (0 = connected)
+static volatile bool s_ap_on_pending = false;     // costean.8: the wifi ctl task should bring the setup hotspot up
+static int64_t s_ap_on_next_us = 0;
 static volatile int64_t s_attempt_us = 0;         // last esp_wifi_connect() call
 static volatile int64_t s_retry_at_us = 0;        // pending join retry (0 = none)
 static volatile int64_t s_ap_off_at_us = 0;       // pending hotspot shutdown (0 = none)
@@ -87,6 +91,10 @@ static volatile int s_ap_off_tries = 0;
 static TaskHandle_t s_ctl_task = NULL;
 #define JOIN_IN_FLIGHT_US   (12 * 1000000LL)      // a join attempt normally ends (connected or failed) well within this
 #define AP_OFF_DELAY_US     (4 * 1000000LL)       // keep the hotspot a few seconds after the IP arrives
+// costean.8: with a saved network the miner joins with the radio in station mode only (no setup hotspot beaconing on
+// channel 1, no phone on the hotspot and no captive-portal traffic while the router handshake runs). The hotspot only
+// comes up once the saved network has been unreachable for this long, and joining keeps retrying in the background.
+#define AP_FALLBACK_US      (90 * 1000000LL)
 
 static const char *get_wifi_reason_string(int reason);
 static void wifi_softap_on(void);
@@ -441,12 +449,8 @@ uint16_t wifi_scan_max_records(void)
 static void ip_timeout_callback(TimerHandle_t xTimer)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvTimerGetTimerID(xTimer);
-    if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
-        ESP_LOGI(TAG, "Timeout waiting for IP address. Disconnecting...");
-        snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (IP timeout)", wifi_fail_text(WIFI_FAIL_NO_IP));
-        s_ip_timed_out = true;
-        esp_wifi_disconnect();   // the disconnect event schedules the retry
-    }
+    // costean.8: runs in the small FreeRTOS timer task, so only set a flag; the wifi ctl task logs and disconnects.
+    if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) s_ip_timeout_pending = true;
 }
 
 static void event_handler(void * arg, esp_event_base_t event_base, int32_t event_id, void * event_data)
@@ -533,7 +537,9 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
             s_link = WIFI_LINK_JOINING;
             GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
             s_ap_off_at_us = 0;
-            wifi_softap_on();
+            // costean.8: no radio mode change in the event handler; the wifi ctl task brings the hotspot up later.
+            if (s_down_since_us == 0) s_down_since_us = esp_timer_get_time();
+            if (esp_timer_get_time() - s_down_since_us >= AP_FALLBACK_US) s_ap_on_pending = true;
 
             // costean.6: keep retrying even while a phone is on the setup hotspot (stock firmware stopped here and
             // the miner could sit on its hotspot forever), but slower then, so the phone keeps a usable link.
@@ -572,6 +578,8 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         // and reboot the miner right after "Acquiring IP"). The wifi ctl task turns the hotspot off a moment later.
         s_ap_off_tries = 0;
         s_ap_off_at_us = esp_timer_get_time() + AP_OFF_DELAY_US;
+        s_down_since_us = 0;
+        s_ap_on_pending = false;
         
         // Create IPv6 link-local address after WiFi connection
         esp_netif_t *netif = event->esp_netif;
@@ -761,6 +769,16 @@ static void wifi_ctl_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(200));
         int64_t now = esp_timer_get_time();
 
+        if (s_ip_timeout_pending) {
+            s_ip_timeout_pending = false;
+            if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
+                ESP_LOGI(TAG, "Timeout waiting for IP address. Disconnecting...");
+                snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (IP timeout)", wifi_fail_text(WIFI_FAIL_NO_IP));
+                s_ip_timed_out = true;
+                esp_wifi_disconnect();   // the disconnect event schedules the retry
+            }
+        }
+
         int64_t retry_at = s_retry_at_us;
         if (retry_at != 0 && now >= retry_at) {
             if (is_scanning) {
@@ -778,6 +796,21 @@ static void wifi_ctl_task(void *arg)
             now - s_attempt_us > 45000000LL && !GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
             ESP_LOGW(TAG, "Join attempt went quiet, retrying");
             sta_connect_now();
+        }
+
+        // costean.8: setup hotspot fallback while the saved network stays unreachable. Only between join attempts,
+        // so switching the radio to AP+STA never cuts a handshake that is in progress.
+        if (sta_configured && !GLOBAL_STATE->SYSTEM_MODULE.is_connected && !GLOBAL_STATE->SYSTEM_MODULE.ap_enabled) {
+            int64_t down = s_down_since_us;
+            if (down != 0 && now - down >= AP_FALLBACK_US) s_ap_on_pending = true;
+            bool between = s_link != WIFI_LINK_DHCP && s_retry_at_us != 0;
+            if (s_ap_on_pending && between && !is_scanning && now >= s_ap_on_next_us) {
+                ESP_LOGW(TAG, "Saved network unreachable for %lld s: setup hotspot on (joining keeps retrying)", (long long) ((now - down) / 1000000));
+                s_ap_on_next_us = now + 5000000LL;
+                wifi_softap_on();
+            }
+        } else {
+            s_ap_on_pending = false;
         }
 
         int64_t off_at = s_ap_off_at_us;
@@ -896,7 +929,7 @@ void wifi_init(GlobalState * GLOBAL_STATE)
     if (ip_acquire_timer == NULL) {
         ip_acquire_timer = xTimerCreate("ip_acquire_timer", pdMS_TO_TICKS(30000), pdFALSE, (void *)GLOBAL_STATE, ip_timeout_callback);
     }
-    if (s_ctl_task == NULL && xTaskCreate(wifi_ctl_task, "wifi ctl", 3072, GLOBAL_STATE, 5, &s_ctl_task) != pdPASS) {
+    if (s_ctl_task == NULL && xTaskCreate(wifi_ctl_task, "wifi ctl", 6144, GLOBAL_STATE, 5, &s_ctl_task) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start the wifi ctl task");
         s_ctl_task = NULL;
     }
@@ -931,6 +964,13 @@ void wifi_init(GlobalState * GLOBAL_STATE)
         esp_netif_t * esp_netif_sta = wifi_init_sta(GLOBAL_STATE->SYSTEM_MODULE.ssid, wifi_pass);
 
         free(wifi_pass);
+
+        // costean.8: join in station mode only; the hotspot (configured above) comes back if the join keeps failing.
+        esp_err_t mode_err = s_ctl_task != NULL ? esp_wifi_set_mode(WIFI_MODE_STA) : ESP_ERR_INVALID_STATE;
+        if (mode_err != ESP_OK) ESP_LOGW(TAG, "Station-only join not possible (%s), keeping the hotspot on", esp_err_to_name(mode_err));
+        else ESP_LOGI(TAG, "Saved network: joining with the setup hotspot off (it comes back after %d s without Wi-Fi)", (int) (AP_FALLBACK_US / 1000000));
+        s_down_since_us = esp_timer_get_time();
+        if (s_down_since_us == 0) s_down_since_us = 1;
 
         /* Disable power savings for best performance */
         esp_wifi_set_ps(WIFI_PS_NONE);

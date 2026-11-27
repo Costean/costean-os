@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { detectUpdate } from '../src/lib/ota.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = +process.env.PORT || 8099, ROOT = path.resolve(process.env.DIST || path.join(__dirname, '../dist/axe-os'));
-let FW = process.env.FW_VERSION || '1.2.0-costean.7';
+let FW = process.env.FW_VERSION || '1.2.0-costean.8';
 // OTA_NOAPPLY=1 simulates an update that uploads but does not take (the costean.4 report), to preview the failure message
 const OTA_NOAPPLY = process.env.OTA_NOAPPLY === '1'; let downUntil = 0, slot = 'ota_0';
 const SC = process.env.SCENARIO || 'normal', BLOCK = SC === 'block', FAILOVER = SC === 'failover', THROTTLE = SC === 'throttle', SETUP = SC === 'setup' || SC === 'setupfail' || SC === 'joining' || SC === 'crashed';
