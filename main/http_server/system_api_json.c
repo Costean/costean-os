@@ -24,6 +24,17 @@
 #include "asic.h"
 #include "costean/boot_guard.h"
 
+// costean.9: boot slot label, refreshed only from tasks with an internal-RAM stack (main task at start-up, HTTP server
+// after an OTA switch). Never touch flash mappings from system_api_get_full_json(): the WebSocket API task calls it.
+static char s_boot_label[17];
+
+void system_api_refresh_boot_partition(void)
+{
+    (void) esp_ota_get_running_partition();   // IDF caches this on first use; make that first use happen here
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    snprintf(s_boot_label, sizeof(s_boot_label), "%s", boot ? boot->label : "");
+}
+
 
 static const char *get_reset_reason_str(esp_reset_reason_t reason)
 {
@@ -149,8 +160,11 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     cJSON_AddStringToObject(root, "runningPartition", running ? running->label : "Unknown");
     {   // Costean OS: lets the Update page prove an update really ran (boot slot + build time)
-        const esp_partition_t *boot = esp_ota_get_boot_partition();
-        cJSON_AddStringToObject(root, "bootPartition", boot ? boot->label : "Unknown");
+        // costean.9: cached label only. esp_ota_get_boot_partition() maps the otadata sector into the cache, which
+        // asserts (s_task_stack_is_sane_when_cache_frozen) when called from a task whose stack is in PSRAM - this
+        // function also runs in the WebSocket API task (PSRAM stack), and that crashed the miner whenever the web UI
+        // was open (costean.5 to costean.8).
+        cJSON_AddStringToObject(root, "bootPartition", s_boot_label[0] ? s_boot_label : "Unknown");
         const esp_app_desc_t *d = esp_app_get_description();
         char built[40];
         snprintf(built, sizeof(built), "%s %s", d->date, d->time);

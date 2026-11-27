@@ -20,4 +20,10 @@ cJSON* system_api_get_full_json(GlobalState * GLOBAL_STATE);
  */
 cJSON* cJSON_CreateFloat(float number);
 
+/**
+ * @brief Re-read the boot partition label shown as "bootPartition". Call only from a task with an internal-RAM stack
+ * (it maps flash). system_api_get_full_json() itself never touches flash mappings.
+ */
+void system_api_refresh_boot_partition(void);
+
 #endif /* SYSTEM_API_JSON_H_ */

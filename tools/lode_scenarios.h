@@ -6,7 +6,7 @@
 static void lode_sample(lode_view_t *v, int scenario)
 {
     memset(v, 0, sizeof(*v));
-    v->version = "1.2.0-costean.8"; v->board = "602";
+    v->version = "1.2.0-costean.1"; v->board = "602";
     strcpy(v->profile, "MANUAL");
     v->ghs = 1194.0f; v->mhz = 525; v->mv = 1150;
     v->chip_c = 58.4f; v->vr_c = 47.0f; v->power_w = 18.6f; v->fan_pct = 52;

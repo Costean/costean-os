@@ -1802,6 +1802,7 @@ static esp_err_t POST_system_boot(httpd_req_t *req)
 
     esp_err_t err = esp_ota_set_boot_partition(p);
     cJSON_Delete(root);
+    system_api_refresh_boot_partition();
 
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to set boot partition");
@@ -2227,6 +2228,7 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
                                                                 : "Could not activate the new firmware. The old firmware keeps running.");
         return ESP_OK;
     }
+    system_api_refresh_boot_partition();
 
     snprintf(GLOBAL_STATE->SYSTEM_MODULE.firmware_update_status, 20, "Rebooting...");
 
@@ -2257,6 +2259,7 @@ esp_err_t http_404_error_handler(httpd_req_t * req, httpd_err_code_t err)
 
 esp_err_t start_rest_server(GlobalState * global_state)
 {
+    system_api_refresh_boot_partition();   // costean.9: main task (internal stack) reads the boot slot once
     GLOBAL_STATE = global_state;
     // Initialize the ASIC API with the global state
     asic_api_init(GLOBAL_STATE);

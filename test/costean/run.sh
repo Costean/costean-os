@@ -18,4 +18,5 @@ for t in t_split t_sched t_tune t_602 t_oled t_guard; do $W/$t || rc=1; done
 B=$ROOT/build; FAC=$(ls $ROOT/../out-c*/esp-miner-factory-602-*.bin 2>/dev/null | tail -n 1)
 $W/t_ota $B/esp-miner.bin $B/www.bin "${FAC:-/nonexistent}" || rc=1
 python3 $T/check_oled_polarity.py || rc=1
+python3 $T/check_psram_flash.py || rc=1
 exit $rc
