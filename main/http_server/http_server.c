@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "esp_app_desc.h"
+#include "costean/boot_guard.h"
 #include "esp_wifi.h"
 #include "esp_vfs.h"
 
@@ -1364,6 +1365,13 @@ static esp_err_t POST_restart(httpd_req_t * req)
 
     ESP_LOGI(TAG, "Restarting System because of API Request");
 
+    // costean.6: POST /api/system/restart?normal=1 leaves safe mode (mining and extras start again).
+    char rq[24];
+    if (httpd_req_get_url_query_str(req, rq, sizeof(rq)) == ESP_OK) {
+        char v[4];
+        if (httpd_query_key_value(rq, "normal", v, sizeof(v)) == ESP_OK && v[0] == '1') boot_guard_leave_safe();
+    }
+
     httpd_resp_set_type(req, "application/json");
 
     cJSON * root = cJSON_CreateObject();
@@ -1384,6 +1392,8 @@ static esp_err_t POST_restart(httpd_req_t * req)
 
     // Restart the system
     costean_before_restart();   // keep the 48 h history
+    nvs_config_flush(3000);     // every just-saved setting (Wi-Fi!) is on flash before the reset
+    boot_guard_restart_requested();
     esp_restart();
 
     // This return statement will never be reached, but it's good practice to include it
@@ -1780,6 +1790,8 @@ static esp_err_t POST_system_boot(httpd_req_t *req)
 
     // Restart the system
     costean_before_restart();   // keep the 48 h history
+    nvs_config_flush(3000);     // every just-saved setting (Wi-Fi!) is on flash before the reset
+    boot_guard_restart_requested();
     esp_restart();
 
     return send_res;
@@ -2077,6 +2089,8 @@ esp_err_t POST_WWW_update(httpd_req_t * req)
     vTaskDelay(1000 / portTICK_PERIOD_MS);
     GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update = false;
     costean_before_restart();   // keep the 48 h history
+    nvs_config_flush(3000);     // every just-saved setting (Wi-Fi!) is on flash before the reset
+    boot_guard_restart_requested();
     esp_restart();
 
     return ESP_OK;
@@ -2194,6 +2208,8 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
     ESP_LOGI(TAG, "Restarting System because of Firmware update complete");
     vTaskDelay(1000 / portTICK_PERIOD_MS);
     costean_before_restart();   // keep the 48 h history
+    nvs_config_flush(3000);     // every just-saved setting (Wi-Fi!) is on flash before the reset
+    boot_guard_restart_requested();
     esp_restart();
 
     return ESP_OK;

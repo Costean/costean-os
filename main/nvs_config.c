@@ -50,6 +50,21 @@ static QueueHandle_t nvs_save_queue = NULL;
 static volatile uint32_t s_write_errors = 0;   // Costean OS: failed flash writes since boot (shown in /api/system/info)
 
 uint32_t nvs_config_write_errors(void) { return s_write_errors; }
+// Costean OS: settings queued but not yet written to flash. nvs_config_flush() waits for this to reach 0 so a
+// "save, then restart" never loses the value it just saved (the Wi-Fi setup page does exactly that).
+static volatile int s_pending_writes = 0;
+static portMUX_TYPE s_pending_mux = portMUX_INITIALIZER_UNLOCKED;
+static void pending_add(int d) { taskENTER_CRITICAL(&s_pending_mux); s_pending_writes += d; taskEXIT_CRITICAL(&s_pending_mux); }
+bool nvs_config_flush(uint32_t timeout_ms)
+{
+    if (nvs_save_queue == NULL) return true;
+    uint32_t waited = 0;
+    while (s_pending_writes > 0 && waited < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited += 20;
+    }
+    return s_pending_writes <= 0;
+}
 static nvs_handle_t handle;
 static SemaphoreHandle_t nvs_cache_mutex = NULL;
 
@@ -403,6 +418,7 @@ static void nvs_task(void *pvParameters)
             else if (update.type == TYPE_STR) {
                 free(update.value.str);
             }
+            pending_add(-1);
         }
     }
 }
@@ -626,7 +642,8 @@ void nvs_config_set_string(NvsConfigKey key, const char *value)
     ConfigUpdate update = { .key = key, .type = TYPE_STR, .value.str = strdup(value) };
     if (!update.value.str) return;
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 void nvs_config_set_string_indexed(NvsConfigKey key, int index, const char *value)
@@ -639,7 +656,8 @@ void nvs_config_set_string_indexed(NvsConfigKey key, int index, const char *valu
     ConfigUpdate update = { .key = key, .type = TYPE_STR, .value.str = strdup(value), .index = index };
     if (!update.value.str) return;
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 uint16_t nvs_config_get_u16(NvsConfigKey key)
@@ -666,7 +684,8 @@ void nvs_config_set_u16(NvsConfigKey key, uint16_t value)
 
     ConfigUpdate update = { .key = key, .type = TYPE_U16, .value.u16 = value };
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 int32_t nvs_config_get_i32(NvsConfigKey key)
@@ -693,7 +712,8 @@ void nvs_config_set_i32(NvsConfigKey key, int32_t value)
 
     ConfigUpdate update = { .key = key, .type = TYPE_I32, .value.i32 = value };
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 uint64_t nvs_config_get_u64(NvsConfigKey key)
@@ -720,7 +740,8 @@ void nvs_config_set_u64(NvsConfigKey key, uint64_t value)
 
     ConfigUpdate update = { .key = key, .type = TYPE_U64, .value.u64 = value };
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 float nvs_config_get_float(NvsConfigKey key)
@@ -747,7 +768,8 @@ void nvs_config_set_float(NvsConfigKey key, float value)
 
     ConfigUpdate update = { .key = key, .type = TYPE_FLOAT, .value.f = value };
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 bool nvs_config_get_bool(NvsConfigKey key)
@@ -774,7 +796,8 @@ void nvs_config_set_bool(NvsConfigKey key, bool value)
 
     ConfigUpdate update = { .key = key, .type = TYPE_BOOL, .value.b = value };
     cache_store(setting, &update);
-    xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    pending_add(1);
+    if (xQueueSend(nvs_save_queue, &update, portMAX_DELAY) != pdTRUE) pending_add(-1);
 }
 
 bool nvs_config_has_key(NvsConfigKey key)

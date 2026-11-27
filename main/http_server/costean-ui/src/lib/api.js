@@ -24,6 +24,7 @@ export const api = {
   putPool: (id, body) => req(`/api/system/pools/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deletePool: (id) => req(`/api/system/pools/${id}`, { method: 'DELETE' }),
   restart: () => req('/api/system/restart', { method: 'POST' }),
+  restartNormal: () => req('/api/system/restart?normal=1', { method: 'POST' }),
   pause: () => req('/api/system/pause', { method: 'POST' }),
   resume: () => req('/api/system/resume', { method: 'POST' }),
   dismissBlock: () => req('/api/system/blockFound/dismiss', { method: 'POST' }),

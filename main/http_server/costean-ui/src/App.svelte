@@ -3,6 +3,9 @@
   import { app, start } from './lib/store.svelte.js';
   import { profileLabel } from './lib/costean.js';
   import { mismatch } from './lib/versions.js';
+  import { api } from './lib/api.js';
+  let leaving = $state(false);
+  async function restartNormal() { leaving = true; try { await api.restartNormal(); } catch { } }
   import Confirm from './components/Confirm.svelte';
   import Dashboard from './pages/Dashboard.svelte';
   import Tuning from './pages/Tuning.svelte';
@@ -71,6 +74,7 @@
   </header>
   <main>
     {#if app.demo}<div class="demo-banner" data-testid="demo">DEMO DATA — mock server, not a real miner</div>{/if}
+    {#if app.info?.safeMode}<div class="card crit" data-testid="safe-banner"><b>Safe mode: mining is paused</b> after {app.info.quickResets || 'repeated'} unexpected restarts in a row{app.info.lastResetText ? ` (last: ${app.info.lastResetText})` : ''}. Settings and updates still work. <button class="pri" onclick={restartNormal} disabled={leaving} data-testid="leave-safe-main">{leaving ? 'Restarting…' : 'Restart normally'}</button></div>{/if}
     {#if mm}<div class="card crit" data-testid="mismatch">⚠ Version mismatch: {mm.text}</div>{/if}
     {#if !app.online && app.lastOk}<div class="card crit">Miner not responding. Last data {Math.round((Date.now() - app.lastOk) / 1000)}s ago.</div>{/if}
     <Page />

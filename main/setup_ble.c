@@ -1,4 +1,5 @@
 #include "setup_ble.h"
+#include "costean/boot_guard.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -319,6 +320,8 @@ static void setup_ble_restart_task(void *param)
 {
     (void)param;
     vTaskDelay(pdMS_TO_TICKS(500));
+    nvs_config_flush(3000);
+    boot_guard_restart_requested();
     esp_restart();
 }
 

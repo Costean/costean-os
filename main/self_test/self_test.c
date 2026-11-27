@@ -1,4 +1,5 @@
 #include <string.h>
+#include "costean/boot_guard.h"
 #include <stdlib.h>
 #include <math.h>
 #include <inttypes.h>
@@ -790,6 +791,8 @@ static void tests_done(GlobalState * GLOBAL_STATE, bool isTestPassed)
             GLOBAL_STATE->SELF_TEST_MODULE.finished = logString;
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
+        nvs_config_flush(3000);
+        boot_guard_restart_requested();
         esp_restart();
     } else {
         // isTestFailed
@@ -811,6 +814,8 @@ static void tests_done(GlobalState * GLOBAL_STATE, bool isTestPassed)
                 nvs_config_set_bool(NVS_CONFIG_SELF_TEST, false);
                 // Wait until NVS is written
                 vTaskDelay(100 / portTICK_PERIOD_MS);
+                nvs_config_flush(3000);
+                boot_guard_restart_requested();
                 esp_restart();
             }
         }

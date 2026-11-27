@@ -7,9 +7,46 @@
 
 Costean OS is a custom firmware for the Bitaxe Gamma 602. (A *costean*, pronounced COS-teen, is an old mining word for a trench dug to find the lode.) It is a source fork of the official [bitaxeorg/ESP-Miner](https://github.com/bitaxeorg/ESP-Miner) **v2.15.4** (GPL-3.0) with a new web UI and extra firmware features written in C.
 
-Version: **1.2.0-costean.5** (Costean OS 1.2, same feature set as Costean OS 1.2 on the NerdOctAxe, scaled for one BM1370), built from **bitaxeorg/ESP-Miner v2.15.4** with **ESP-IDF v6.0.3**.
+Version: **1.2.0-costean.7** (Costean OS 1.2, same feature set as Costean OS 1.2 on the NerdOctAxe, scaled for one BM1370), built from **bitaxeorg/ESP-Miner v2.15.4** with **ESP-IDF v6.0.3**.
 
 ![Dashboard](docs/screenshots/web-01-dashboard.png)
+
+## New in 1.2.0-costean.7: clean Wi-Fi setup on a fresh miner, crash dump
+
+- **Fixed: a freshly flashed miner thought a network called `myssid` was saved.** The factory settings store an empty Wi-Fi name and password, and the settings loader replaces an empty value with the built-in default, which was the upstream placeholder `myssid` / `mypassword`. So a new miner kept trying to join `myssid`, and the setup page could say *Couldn't join "myssid"*. The defaults are now empty, so a fresh miner simply waits for you to pick a network.
+- **Fixed: an open network (no password) could stop working after a restart.** The empty password came back as `mypassword`, so the miner tried WPA2 on an open network. Same fix.
+- **Crash dump.** If the firmware ever crashes, it now keeps a crash dump in the existing 64 KB `coredump` flash partition (0xf12000). Nothing changes for normal use; it helps find the cause of a restart without a USB cable attached at the time.
+- Includes every costean.6 fix below. costean.6 was not released on its own; costean.7 is the first public build with the Wi-Fi join and restart fixes.
+
+## New in 1.2.0-costean.6: Wi-Fi setup that sticks, restart reasons, safe mode
+
+- **Fixed: after typing the Wi-Fi password the miner could restart again and again, or keep coming back to its `Bitaxe_XXXX` hotspot.** Several problems in the join path, all fixed:
+  - **A restart right after "Acquiring IP".** When the IP address arrived, the firmware switched the setup hotspot off *inside* the Wi-Fi event handler, and any error from the Wi-Fi driver there (for example while the setup page was scanning) stopped the firmware and rebooted the miner. The hotspot is now switched off a few seconds later from a separate task, only when no scan is running. It is retried if the driver is busy. A Wi-Fi driver error is logged and never restarts the miner.
+  - **Scans during the join.** The setup page scans when it opens. If the phone was still on the hotspot, that scan took the radio off-channel while the miner was getting its IP address (so DHCP timed out), or it cut a join attempt. The miner now refuses to scan while it joins or waits for an IP address, and the page does not ask for one then.
+  - **Stuck on the hotspot.** Stock firmware stopped retrying the saved network while any phone was on the hotspot. The miner now keeps retrying: every 3 s at first, then every 10 s, and every 15 s while a phone is on the hotspot. Retries no longer block the Wi-Fi event task.
+  - **Bluetooth setup now starts only when it is needed.** If a network is saved, setup Bluetooth starts only after 90 s of failed joins (it used to start 5 s into every join and was torn down on connect). With nothing saved it still starts after 5 s.
+  - **Save, then restart.** Settings are now written to flash before every restart the firmware asks for, so the Wi-Fi name and password can no longer be lost by restarting too soon.
+  - More stack for the Wi-Fi/IP event task (4096 bytes).
+- **Clear reason when the join fails.** The OLED status line and the setup page now say *Wrong password?*, *Network not found* (it uses 2.4 GHz only), *Security type not supported* (WPA3-only, Enterprise or WEP), *Router refused the miner*, *Weak signal* or *No IP address from router*, with the error number and the retry count. The setup page only says "Couldn't join" after a real failure. While the miner is still joining, it says *Joining "…"* or *Joined, getting an IP address…* so you don't type the password again (doing that restarted the miner every time).
+- **Restart reasons.** The miner remembers why its last run ended (crash, watchdog, brownout, power-on or a normal restart) and what it was doing then (joining Wi-Fi, waiting for an IP address, powering up the ASIC, starting services, mining). While it is not connected, the OLED status line adds for example `| Last reset: PANIC at DHCP`. The setup page and Diagnostics show the same, plus the Wi-Fi status at the time. Over the API, `/api/system/info` has `lastResetReason`, `lastResetPhase`, `lastResetText`, `lastResetWifi`, `bootCount`, `quickResets`, `safeMode`, `wifiLink`, `wifiFailReason`, `wifiFailCode`, `wifiFailText` and `wifiFailHint`.
+- **Boot-loop guard and safe mode.** Three unexpected resets in a row, each within 2 minutes of starting, switch on **safe mode**. Crashes, watchdog resets, brownouts and restarts the firmware did not ask for all count. Power-on, the reset button, USB flashing and normal restarts after saving do not.
+  - In safe mode the miner only runs Wi-Fi, the setup hotspot and the web UI. The ASIC stays off, and mining, tuning, pool split, alerts and Bluetooth do not start.
+  - The OLED shows `SAFE MODE` with the reason and the miner's address. The web UI shows a red banner with **Restart normally**. Safe mode stays on until you press that button.
+- The Setup and Diagnostics pages show the new information. All costean.5, costean.4 and costean.3 fixes are kept.
+- **What to look for on the miner's screen:**
+  - **`Acquiring IP...`, then a restart:** the post-connect crash fixed above. On costean.6 the status line names the cause on the next boot.
+  - **`Wrong password? (Error 15, retry #N)`**, or `Error 204`: the password is wrong, so pick the network again.
+  - **`Network not found (Error 201 …)`:** wrong name, out of range, or a 5 GHz-only network.
+  - **`SELF-TEST` screen:** see the recovery steps below.
+
+![Setup: join failed, with the reason](docs/screenshots/setup-05-join-failed.png)
+![Setup: still joining, no need to re-enter the password](docs/screenshots/setup-06-joining.png)
+![Safe mode banner](docs/screenshots/safe-mode-dashboard.png)
+
+- **Recovering a miner that keeps restarting:** flash `esp-miner-factory-602-v1.2.0-costean.7.bin` at **0x0** over USB (see Flashing). This resets all settings.
+  - The first boot after a factory flash runs the built-in **self-test**. If it passes, the miner restarts by itself after about 10 s. If it fails, the screen says so; **hold the BOOT button for 2 seconds** to cancel it.
+  - Then join the `Bitaxe_XXXX` hotspot, pick your network and enter the password once.
+  - If a miner that is already on costean.6 or later lands in safe mode, open its address and press **Restart normally**.
 
 ## New in 1.2.0-costean.5: updates you can check, screen colors, your own profiles
 
@@ -120,7 +157,7 @@ Get the files from the [Releases](../../releases) page.
 
 | File | What it is |
 |------|------------|
-| `esp-miner-factory-602-v1.2.0-costean.5.bin` | Full factory image (bootloader, partition table, official 602 NVS defaults, firmware, otadata). Flash at **0x0**. **This wipes all settings.** |
+| `esp-miner-factory-602-v1.2.0-costean.7.bin` | Full factory image (bootloader, partition table, official 602 NVS defaults, firmware, otadata). Flash at **0x0**. **This wipes all settings.** |
 | `esp-miner.bin` | OTA app image. Keeps your settings. The Costean web UI is built in. |
 | `www.bin` | Optional SPIFFS web UI partition (3 MB), only for the custom-WWW option. Not needed for normal installs. |
 | `SHA256SUMS` | SHA-256 of each file. Check it with `sha256sum -c SHA256SUMS`. |
@@ -136,7 +173,7 @@ Hold the BOOT button if the board is not already in download mode. Replace `PORT
 ```bash
 esptool --chip esp32s3 -p PORT -b 460800 --before default-reset --after hard-reset \
   write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m \
-  0x0 esp-miner-factory-602-v1.2.0-costean.5.bin
+  0x0 esp-miner-factory-602-v1.2.0-costean.7.bin
 ```
 
 You can also use [esptool-js](https://espressif.github.io/esptool-js/) and flash the factory file at address `0x0`.

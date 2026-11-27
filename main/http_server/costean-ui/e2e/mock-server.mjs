@@ -5,10 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { detectUpdate } from '../src/lib/ota.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = +process.env.PORT || 8099, ROOT = path.resolve(process.env.DIST || path.join(__dirname, '../dist/axe-os'));
-let FW = process.env.FW_VERSION || '1.2.0-costean.5';
+let FW = process.env.FW_VERSION || '1.2.0-costean.7';
 // OTA_NOAPPLY=1 simulates an update that uploads but does not take (the costean.4 report), to preview the failure message
 const OTA_NOAPPLY = process.env.OTA_NOAPPLY === '1'; let downUntil = 0, slot = 'ota_0';
-const SC = process.env.SCENARIO || 'normal', BLOCK = SC === 'block', FAILOVER = SC === 'failover', THROTTLE = SC === 'throttle', SETUP = SC === 'setup' || SC === 'setupfail';
+const SC = process.env.SCENARIO || 'normal', BLOCK = SC === 'block', FAILOVER = SC === 'failover', THROTTLE = SC === 'throttle', SETUP = SC === 'setup' || SC === 'setupfail' || SC === 'joining' || SC === 'crashed';
+let SAFE = SC === 'safemode';
 export const writes = [];
 // NVS emulation: NVS_FILE keeps settings across a mock "reboot" (kill + start again with the same file).
 const NVS_FILE = process.env.NVS_FILE || '';
@@ -77,8 +78,16 @@ function info() {
     overheat_mode: 0, miningPaused: 0, freeHeap: 120000, isUsingFallbackStratum: 0, primaryPoolIndex: S.primaryPoolIndex, secondaryPoolIndex: S.secondaryPoolIndex, useFallbackStratum: 1,
     poolSplitActive: S.poolSplitEnabled ? 1 : 0, poolSplitError: 'ok', poolSplitFailover: FAILOVER ? 1 : 0, poolSplitRestartNeeded: 0,
     poolSplitStats: S.poolSplitEnabled ? splitStats(hr) : [], pools: [...pools].sort((a, b) => a.id - b.id), resetReason: 'Power-on', nvsWriteErrors: 0, nvsFreeEntries: 412,
-    apEnabled: SETUP ? 1 : 0, apSsid: 'Bitaxe_6A2F', wifiStatus: SC === 'setupfail' ? 'Incorrect password entered (Error 15, retry #2)' : SETUP ? 'Setup: choose a Wi-Fi network' : 'Connected!',
-    ...(SC === 'setup' ? { ssid: '', ipv4: '', wifiRSSI: 0 } : SC === 'setupfail' ? { ssid: 'DEMO-Home', ipv4: '' } : {}) };
+    apEnabled: SETUP ? 1 : 0, apSsid: 'Bitaxe_6A2F', wifiStatus: SC === 'setupfail' ? 'Wrong password? (Error 15, retry #2)' : SC === 'joining' ? 'Acquiring IP...' : SC === 'crashed' ? 'Connecting...' : SETUP ? 'Setup: choose a Wi-Fi network' : 'Connected!',
+    wifiLink: SC === 'joining' ? 'dhcp' : SC === 'crashed' ? 'joining' : SC === 'setup' ? 'idle' : SC === 'setupfail' ? 'joining' : 'up',
+    wifiFailReason: SC === 'setupfail' ? 15 : 0, wifiFailCode: SC === 'setupfail' ? 'password' : '', wifiFailText: SC === 'setupfail' ? 'Wrong password?' : '',
+    wifiFailHint: SC === 'setupfail' ? 'The router rejected the password. Passwords are case-sensitive.' : '', wifiRetries: SC === 'setupfail' ? 2 : 0,
+    lastResetReason: SAFE || SC === 'crashed' ? 'Crash (panic)' : 'Power on', lastResetCode: SAFE || SC === 'crashed' ? 4 : 1,
+    lastResetPhase: SAFE || SC === 'crashed' ? 'finishing the Wi-Fi connection' : '', lastResetUnexpected: SAFE || SC === 'crashed',
+    lastResetText: SAFE || SC === 'crashed' ? 'Crash (panic) while finishing the Wi-Fi connection' : '', lastResetWifi: SAFE || SC === 'crashed' ? 'Connected!' : '',
+    bootCount: SAFE ? 7 : 3, quickResets: SAFE ? 3 : SC === 'crashed' ? 1 : 0, safeMode: SAFE ? 1 : 0,
+    ...(SC === 'setup' ? { ssid: '', ipv4: '', wifiRSSI: 0 } : SC === 'setupfail' || SC === 'joining' || SC === 'crashed' ? { ssid: 'DEMO-Home', ipv4: '' } : {}),
+    ...(SAFE ? { hashRate: 0, hashRate_1m: 0, hashRate_10m: 0, hashRate_1h: 0, power: 3.1 } : {}) };
 }
 function costean() {
   const now = Math.floor(Date.now() / 1000), local = now - 5 * 3600, min = Math.floor((local % 86400) / 60), night = min >= 22 * 60 || min < 7 * 60;
@@ -132,7 +141,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (p.startsWith('/api/')) {
     if (m !== 'GET') {
-      const b = await body(req); writes.push({ m, p, body: b.length < 8192 ? b : undefined });
+      const b = await body(req); writes.push({ m, p, q: u.search, body: b.length < 8192 ? b : undefined });
+      if (p === '/api/system/restart' && u.searchParams.get('normal') === '1') { SAFE = false; downUntil = Date.now() + 1500; }
       try {
         if (p === '/api/system' && m === 'PATCH') { const o = JSON.parse(b || '{}');
           // same checks as the firmware's check_settings_and_update (an empty slot = URL and user both empty)
@@ -165,6 +175,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/system/scoreboard') return json(res, scoreboard);
     if (p === '/api/system/statistics/dashboard') return json(res, { labels: [], datasets: [] });
     if (p === '/api/system/logs') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(`I (123) Costean OS ${FW} started [DEMO]\nI (900) costean: profile Manual 525 MHz / 1150 mV [DEMO]\n`); }
+    if (p === '/api/system/wifi/scan' && SC === 'joining') { writes.push({ m, p }); return json(res, { error: 'scan busy, try again', networks: [] }, 503); }
     if (p === '/api/system/wifi/scan') { await new Promise(r => setTimeout(r, SETUP ? 1600 : 300));
       return json(res, { cached: false, ageMs: 0, networks: SETUP ? [
         { ssid: 'DEMO-Home', rssi: -48, authmode: 3 }, { ssid: 'DEMO-Home', rssi: -63, authmode: 3 }, { ssid: 'DEMO-Home-5G', rssi: -58, authmode: 7 },

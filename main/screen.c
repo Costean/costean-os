@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include "costean/boot_guard.h"
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
@@ -81,6 +82,7 @@ static lv_obj_t *self_test_finished_label;
 static lv_obj_t *overheat_ip_addr_label;
 
 static lv_obj_t *asic_status_label;
+static lv_obj_t *asic_status_title_label;
 
 static lv_obj_t *mining_block_height_label;
 static lv_obj_t *mining_network_difficulty_label;
@@ -459,10 +461,11 @@ static lv_obj_t * create_scr_overheat() {
 static lv_obj_t * create_scr_asic_status() {
     lv_obj_t * scr = create_flex_screen(2);
 
-    lv_obj_t *label1 = lv_label_create(scr);
-    lv_label_set_text(label1, "ASIC STATUS:");
+    asic_status_title_label = lv_label_create(scr);
+    lv_label_set_text(asic_status_title_label, "ASIC STATUS:");
 
     asic_status_label = lv_label_create(scr);
+    lv_obj_set_width(asic_status_label, LV_HOR_RES);
     lv_label_set_long_mode(asic_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
 
     return scr;
@@ -932,7 +935,9 @@ static void screen_update_cb(lv_timer_t * timer)
     }
 
     if (module->asic_status) {
-        lv_label_set_text(asic_status_label, module->asic_status);
+        const char *title = boot_guard_safe_mode() ? "SAFE MODE" : "ASIC STATUS:";
+        if (strcmp(lv_label_get_text(asic_status_title_label), title) != 0) lv_label_set_text(asic_status_title_label, title);
+        if (strcmp(lv_label_get_text(asic_status_label), module->asic_status) != 0) lv_label_set_text(asic_status_label, module->asic_status);
 
         screen_show(SCR_ASIC_STATUS);
         return;
@@ -955,9 +960,19 @@ static void screen_update_cb(lv_timer_t * timer)
         return;
     }
 
-    bool is_wifi_status_changed = strcmp(module->wifi_status, lv_label_get_text(connection_wifi_status_label)) != 0;
+    // costean.6: while not connected, the status line also says why the previous run ended (crash, watchdog,
+    // brownout) and whether safe mode is on, so a reboot loop can be told apart from a wrong password.
+    static char status_text[sizeof(module->wifi_status) + 96];
+    const bg_state_t *bg = boot_guard_state();
+    if (!module->is_connected && (bg->safe || (bg->last_unexpected && esp_timer_get_time() < 300000000LL))) {
+        snprintf(status_text, sizeof(status_text), "%s | %sLast reset: %s%s%s", module->wifi_status, bg->safe ? "SAFE MODE | " : "",
+                 bg_reason_short(bg->last_reason), bg->last_phase ? " at " : "", bg->last_phase ? bg_phase_short(bg->last_phase) : "");
+    } else {
+        snprintf(status_text, sizeof(status_text), "%s", module->wifi_status);
+    }
+    bool is_wifi_status_changed = strcmp(status_text, lv_label_get_text(connection_wifi_status_label)) != 0;
     if (is_wifi_status_changed) {
-        lv_label_set_text(connection_wifi_status_label, module->wifi_status);
+        lv_label_set_text(connection_wifi_status_label, status_text);
         screen_show(SCR_CONNECTION);
         return;
     }

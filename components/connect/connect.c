@@ -21,6 +21,8 @@
 #include "global_state.h"
 #include "nvs_config.h"
 #include "esp_app_desc.h"
+#include "esp_timer.h"
+#include "wifi_fail.h"
 
 // Maximum number of access points to scan
 #define MAX_AP_COUNT 32
@@ -71,9 +73,26 @@ static bool sta_configured = false;
 static bool mdns_initialized = false;
 static bool mdns_init_in_progress = false;
 
+// Costean OS (costean.6): connection state machine helpers. Nothing in the Wi-Fi event handler blocks or aborts any
+// more; delayed work (join retries, turning the setup hotspot off after the IP arrives) runs in the small
+// "wifi ctl" task below. A failed esp_wifi_* call is logged and retried, never turned into a reboot.
+static volatile wifi_link_t s_link = WIFI_LINK_IDLE;
+static volatile int s_last_reason = 0;            // last disconnect reason (0 = none since the last success)
+static volatile wifi_fail_t s_last_fail = WIFI_FAIL_NONE;
+static volatile bool s_ip_timed_out = false;      // our own disconnect after the DHCP timeout
+static volatile int64_t s_attempt_us = 0;         // last esp_wifi_connect() call
+static volatile int64_t s_retry_at_us = 0;        // pending join retry (0 = none)
+static volatile int64_t s_ap_off_at_us = 0;       // pending hotspot shutdown (0 = none)
+static volatile int s_ap_off_tries = 0;
+static TaskHandle_t s_ctl_task = NULL;
+#define JOIN_IN_FLIGHT_US   (12 * 1000000LL)      // a join attempt normally ends (connected or failed) well within this
+#define AP_OFF_DELAY_US     (4 * 1000000LL)       // keep the hotspot a few seconds after the IP arrives
+
 static const char *get_wifi_reason_string(int reason);
 static void wifi_softap_on(void);
 static void wifi_softap_off(void);
+static void sta_connect_now(void);
+static void wifi_schedule_retry(int delay_ms);
 
 esp_err_t wifi_apply_hostname(const char *hostname)
 {
@@ -329,13 +348,27 @@ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
         return ESP_ERR_INVALID_STATE;
     }
 
+    // costean.6: never scan while the miner is getting its IP address (off-channel trips make DHCP time out), and
+    // never cut a join attempt that is still in flight. The web page keeps its last list meanwhile.
+    if (sta_configured && s_link == WIFI_LINK_DHCP) {
+        ESP_LOGI(TAG, "Not scanning: waiting for an IP address");
+        return ESP_ERR_INVALID_STATE;
+    }
+    int64_t now_us = esp_timer_get_time();
+    bool in_flight = sta_configured && s_link == WIFI_LINK_JOINING && s_retry_at_us == 0 && s_attempt_us != 0 &&
+                     now_us - s_attempt_us < JOIN_IN_FLIGHT_US;
+    if (in_flight) {
+        ESP_LOGI(TAG, "Not scanning: a Wi-Fi join attempt is in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG, "Starting Wi-Fi scan!");
     is_scanning = true;
 
     wifi_ap_record_t current_ap_info;
     bool sta_linked = esp_wifi_sta_get_ap_info(&current_ap_info) == ESP_OK;
-    if (sta_configured && !sta_linked) {
-        // A pending join attempt blocks the scan; stop it, the join is resumed after the scan.
+    if (sta_configured && !sta_linked && s_retry_at_us == 0) {
+        // A join attempt that never finished blocks the scan; stop it, the join is resumed after the scan.
         ESP_LOGI(TAG, "Pausing Wi-Fi join so that we can scan");
         esp_wifi_disconnect();
         vTaskDelay(300 / portTICK_PERIOD_MS);
@@ -361,7 +394,7 @@ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi scan start failed with error: %s", esp_err_to_name(err));
         is_scanning = false;
-        if (sta_configured && !sta_linked) esp_wifi_connect();
+        if (sta_configured && !sta_linked) wifi_schedule_retry(1000);
         return err;
     }
 
@@ -375,7 +408,7 @@ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
         ESP_LOGW(TAG, "Wi-Fi scan timed out");
         esp_wifi_scan_stop();
         is_scanning = false;
-        if (sta_configured && !sta_linked) esp_wifi_connect();
+        if (sta_configured && !sta_linked) wifi_schedule_retry(1000);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -393,7 +426,7 @@ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
     // Disconnect events were ignored while scanning, so resume the join here.
     if (sta_configured && !sta_linked && !wifi_is_connected()) {
         ESP_LOGI(TAG, "Resuming Wi-Fi join after scan");
-        esp_wifi_connect();
+        wifi_schedule_retry(500);
     }
 
     ESP_LOGD(TAG, "Finished Wi-Fi scan!");
@@ -410,8 +443,9 @@ static void ip_timeout_callback(TimerHandle_t xTimer)
     GlobalState *GLOBAL_STATE = (GlobalState *)pvTimerGetTimerID(xTimer);
     if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
         ESP_LOGI(TAG, "Timeout waiting for IP address. Disconnecting...");
-        strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "IP Acquire Timeout");
-        esp_wifi_disconnect();
+        snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (IP timeout)", wifi_fail_text(WIFI_FAIL_NO_IP));
+        s_ip_timed_out = true;
+        esp_wifi_disconnect();   // the disconnect event schedules the retry
     }
 }
 
@@ -461,12 +495,14 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         if (event_id == WIFI_EVENT_STA_START && sta_configured) {
             ESP_LOGI(TAG, "Connecting...");
             strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connecting...");
-            esp_wifi_connect();
+            sta_connect_now();
         }
 
         if (event_id == WIFI_EVENT_STA_CONNECTED) {
             ESP_LOGI(TAG, "Acquiring IP...");
             strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Acquiring IP...");
+            s_link = WIFI_LINK_DHCP;
+            s_retry_at_us = 0;
 
             if (ip_acquire_timer == NULL) {
                 ip_acquire_timer = xTimerCreate("ip_acquire_timer", pdMS_TO_TICKS(30000), pdFALSE, (void *)GLOBAL_STATE, ip_timeout_callback);
@@ -485,30 +521,29 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
                 ESP_LOGI(TAG, "We are roaming, nothing to do");
                 return;
             }
-
-            ESP_LOGI(TAG, "Could not connect to '%.*s' [rssi %d]: reason %d", event->ssid_len, event->ssid, event->rssi, event->reason);
-            if (clients_connected_to_ap > 0) {
-                ESP_LOGI(TAG, "Client(s) connected to AP, not retrying...");
-                snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "Config AP connected!");
-                return;
-            }
-
-            GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
-            wifi_softap_on();
-
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (Error %d, retry #%d)", get_wifi_reason_string(event->reason), event->reason, s_retry_num);
-            ESP_LOGI(TAG, "Wi-Fi status: %s", GLOBAL_STATE->SYSTEM_MODULE.wifi_status);
-
-            // Wait a little
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying Wi-Fi connection...");
-            esp_wifi_connect();
-
             if (ip_acquire_timer != NULL) {
                 xTimerStop(ip_acquire_timer, 0);
-            }            
+            }
+
+            ESP_LOGI(TAG, "Could not connect to '%.*s' [rssi %d]: reason %d", event->ssid_len, event->ssid, event->rssi, event->reason);
+            wifi_fail_t fail = s_ip_timed_out ? WIFI_FAIL_NO_IP : wifi_fail_classify(event->reason);
+            s_ip_timed_out = false;
+            s_last_reason = event->reason;
+            s_last_fail = fail;
+            s_link = WIFI_LINK_JOINING;
+            GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
+            s_ap_off_at_us = 0;
+            wifi_softap_on();
+
+            // costean.6: keep retrying even while a phone is on the setup hotspot (stock firmware stopped here and
+            // the miner could sit on its hotspot forever), but slower then, so the phone keeps a usable link.
+            int delay_ms = clients_connected_to_ap > 0 ? 15000 : (s_retry_num < 3 ? 3000 : 10000);
+            snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (Error %d, retry #%d)",
+                     wifi_fail_text(fail), event->reason, s_retry_num + 1);
+            ESP_LOGI(TAG, "Wi-Fi status: %s (%s); next try in %d s", GLOBAL_STATE->SYSTEM_MODULE.wifi_status,
+                     get_wifi_reason_string(event->reason), delay_ms / 1000);
+            s_retry_num++;
+            wifi_schedule_retry(delay_ms);
         }
         
     }
@@ -528,12 +563,19 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
 
         ESP_LOGI(TAG, "Connected to SSID: %s", GLOBAL_STATE->SYSTEM_MODULE.ssid);
         strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!");
+        s_link = WIFI_LINK_UP;
+        s_last_reason = 0;
+        s_last_fail = WIFI_FAIL_NONE;
+        s_retry_at_us = 0;
 
-        wifi_softap_off();
+        // costean.6: do not switch the radio mode inside the event handler (a scan or a busy driver made that abort
+        // and reboot the miner right after "Acquiring IP"). The wifi ctl task turns the hotspot off a moment later.
+        s_ap_off_tries = 0;
+        s_ap_off_at_us = esp_timer_get_time() + AP_OFF_DELAY_US;
         
         // Create IPv6 link-local address after WiFi connection
         esp_netif_t *netif = event->esp_netif;
-        esp_err_t ipv6_err = esp_netif_create_ip6_linklocal(netif);
+        esp_err_t ipv6_err = netif ? esp_netif_create_ip6_linklocal(netif) : ESP_ERR_INVALID_ARG;
         if (ipv6_err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to create IPv6 link-local address: %s", esp_err_to_name(ipv6_err));
         }
@@ -592,7 +634,8 @@ esp_netif_t * wifi_init_softap(GlobalState * GLOBAL_STATE)
     wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
     wifi_ap_config.ap.pmf_cfg.required = false;
 
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config);
+    if (err != ESP_OK) ESP_LOGE(TAG, "Setup hotspot config failed: %s", esp_err_to_name(err));
 
     return esp_netif_ap;
 }
@@ -611,8 +654,10 @@ void toggle_wifi_softap(void)
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&mode);
     if (is_wifi_operation_allowed(err)) {
-        ESP_ERROR_CHECK(err);
-    
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_get_mode failed: %s", esp_err_to_name(err));
+            return;
+        }
         if (mode == WIFI_MODE_APSTA) {
             wifi_softap_off();
         } else {
@@ -623,9 +668,10 @@ void toggle_wifi_softap(void)
 
 static void wifi_softap_off(void)
 {
+    s_ap_off_at_us = 0;
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (is_wifi_operation_allowed(err)) {
-        ESP_ERROR_CHECK(err);
+    if (is_wifi_operation_allowed(err) && err != ESP_OK) {
+        ESP_LOGE(TAG, "Turning the setup hotspot off failed: %s", esp_err_to_name(err));
     }
 }
 
@@ -682,10 +728,85 @@ static char* check_and_resolve_hostname_conflict(const char *hostname, const cha
 static void wifi_softap_on(void)
 {
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    if (is_wifi_operation_allowed(err)) {
-        ESP_ERROR_CHECK(err);
+    if (is_wifi_operation_allowed(err) && err != ESP_OK) {
+        ESP_LOGE(TAG, "Turning the setup hotspot on failed: %s", esp_err_to_name(err));
     }
 }
+
+static void sta_connect_now(void)
+{
+    s_retry_at_us = 0;
+    s_attempt_us = esp_timer_get_time();
+    if (s_link != WIFI_LINK_UP) s_link = WIFI_LINK_JOINING;
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_connect failed: %s, retrying shortly", esp_err_to_name(err));
+        s_retry_at_us = esp_timer_get_time() + 2000000LL;
+    }
+}
+
+static void wifi_schedule_retry(int delay_ms)
+{
+    if (!sta_configured) return;
+    int64_t at = esp_timer_get_time() + (int64_t) delay_ms * 1000;
+    if (at == 0) at = 1;
+    s_retry_at_us = at;
+}
+
+// Delayed Wi-Fi work. Runs outside the event loop, so the event task never sleeps or aborts.
+static void wifi_ctl_task(void *arg)
+{
+    GlobalState *GLOBAL_STATE = (GlobalState *) arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        int64_t now = esp_timer_get_time();
+
+        int64_t retry_at = s_retry_at_us;
+        if (retry_at != 0 && now >= retry_at) {
+            if (is_scanning) {
+                s_retry_at_us = now + 1000000LL;          // after the scan
+            } else if (GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
+                s_retry_at_us = 0;
+            } else {
+                ESP_LOGI(TAG, "Retrying Wi-Fi connection...");
+                sta_connect_now();
+            }
+        }
+
+        // Lost-event safety net: a join attempt that produced no event at all for 45 s is retried.
+        if (sta_configured && s_link == WIFI_LINK_JOINING && s_retry_at_us == 0 && !is_scanning && s_attempt_us != 0 &&
+            now - s_attempt_us > 45000000LL && !GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
+            ESP_LOGW(TAG, "Join attempt went quiet, retrying");
+            sta_connect_now();
+        }
+
+        int64_t off_at = s_ap_off_at_us;
+        if (off_at != 0 && now >= off_at) {
+            if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
+                s_ap_off_at_us = 0;                        // link dropped again: keep the hotspot
+            } else if (is_scanning) {
+                s_ap_off_at_us = now + 1000000LL;
+            } else {
+                esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+                if (err == ESP_OK || !is_wifi_operation_allowed(err)) {
+                    ESP_LOGI(TAG, "Setup hotspot off (connected)");
+                    s_ap_off_at_us = 0;
+                } else if (++s_ap_off_tries < 10) {
+                    ESP_LOGW(TAG, "Turning the setup hotspot off failed (%s), trying again", esp_err_to_name(err));
+                    s_ap_off_at_us = now + 2000000LL;
+                } else {
+                    ESP_LOGE(TAG, "Setup hotspot could not be turned off (%s); leaving it on", esp_err_to_name(err));
+                    s_ap_off_at_us = 0;
+                }
+            }
+        }
+    }
+}
+
+wifi_link_t wifi_link_state(void) { return s_link; }
+int wifi_last_disconnect_reason(void) { return s_last_reason; }
+wifi_fail_t wifi_last_fail(void) { return s_last_fail; }
+int wifi_retry_count(void) { return s_retry_num; }
 
 /* Initialize wifi station */
 esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
@@ -743,7 +864,8 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
     // strncpy((char *) wifi_sta_config.sta.password, wifi_pass, 63);
     // wifi_sta_config.sta.password[63] = '\0';
 
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+    esp_err_t cfg_err = esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config);
+    if (cfg_err != ESP_OK) ESP_LOGE(TAG, "Wi-Fi station config failed: %s", esp_err_to_name(cfg_err));
 
     // IPv6 link-local address will be created after WiFi connection
     
@@ -771,6 +893,14 @@ void wifi_init(GlobalState * GLOBAL_STATE)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    if (ip_acquire_timer == NULL) {
+        ip_acquire_timer = xTimerCreate("ip_acquire_timer", pdMS_TO_TICKS(30000), pdFALSE, (void *)GLOBAL_STATE, ip_timeout_callback);
+    }
+    if (s_ctl_task == NULL && xTaskCreate(wifi_ctl_task, "wifi ctl", 3072, GLOBAL_STATE, 5, &s_ctl_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start the wifi ctl task");
+        s_ctl_task = NULL;
+    }
+
     wifi_softap_on();
 
     /* Initialize AP */
@@ -784,10 +914,11 @@ void wifi_init(GlobalState * GLOBAL_STATE)
         sta_configured = false;
 
         /* Start WiFi */
-        ESP_ERROR_CHECK(esp_wifi_start());
+        esp_err_t start_err = esp_wifi_start();
+        if (start_err != ESP_OK) ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(start_err));
 
         /* Disable power savings for best performance */
-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        esp_wifi_set_ps(WIFI_PS_NONE);
 
         return;
     } else {
@@ -802,7 +933,7 @@ void wifi_init(GlobalState * GLOBAL_STATE)
         free(wifi_pass);
 
         /* Disable power savings for best performance */
-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        esp_wifi_set_ps(WIFI_PS_NONE);
 
         char * hostname  = nvs_config_get_string(NVS_CONFIG_HOSTNAME);
 
@@ -817,7 +948,8 @@ void wifi_init(GlobalState * GLOBAL_STATE)
         free(hostname);
 
         /* Start Wi-Fi */
-        ESP_ERROR_CHECK(esp_wifi_start());
+        esp_err_t start_err = esp_wifi_start();
+        if (start_err != ESP_OK) ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(start_err));
 
         ESP_LOGI(TAG, "wifi_init_sta finished.");
     }

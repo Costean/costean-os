@@ -1,10 +1,9 @@
 <script>
   // Costean OS first-run Wi-Fi setup. Shown automatically while the setup hotspot is up (fresh flash, or the saved
   // network can't be joined), and at #/wifi from System & Network. Scans on open, tap a network, type the password.
-  import { onMount } from 'svelte';
-  import { app } from '../lib/store.svelte.js';
+    import { app } from '../lib/store.svelte.js';
   import { api } from '../lib/api.js';
-  import { cleanNetworks, bars, signalLabel, securityLabel, isOpen, passwordProblem, ssidProblem } from '../lib/wifi.js';
+  import { cleanNetworks, bars, signalLabel, securityLabel, isOpen, passwordProblem, ssidProblem, joinState, resetNotice } from '../lib/wifi.js';
 
   let { onskip = () => {} } = $props();
   let networks = $state([]);
@@ -23,7 +22,14 @@
 
   const i = $derived(app.info || {});
   const apMode = $derived(!!i.apEnabled);
-  const failed = $derived(apMode && i.ssid && i.ssid !== 'Unknown' && i.wifiStatus && !/^Connected/.test(i.wifiStatus) && !/^Setup/.test(i.wifiStatus) ? i.wifiStatus : '');
+  // costean.6: only a real failure shows "Couldn't join" (it used to show while the miner was still joining, which
+  // invited typing the password again and restarting the miner in a loop).
+  const js = $derived(joinState(i));
+  const failed = $derived(apMode && js.kind === 'failed' ? js : null);
+  const busy = $derived(apMode && (js.kind === 'joining' || js.kind === 'dhcp'));
+  const rn = $derived(resetNotice(i));
+  let leaving = $state(false);
+  async function restartNormal() { leaving = true; try { await api.restartNormal(); } catch { } }
   const pProblem = $derived(chosen ? passwordProblem(pass, chosen.authmode) : '');
   const sProblem = $derived(step === 'manual' ? ssidProblem(manualSsid) : '');
   const host = $derived(i.hostname && i.hostname !== 'Unknown' ? i.hostname : 'bitaxe');
@@ -75,7 +81,9 @@
     step = 'saved';
   }
 
-  onMount(() => { scan(false); });
+  // Do not scan while the miner is joining or getting its IP (the miner refuses anyway: a scan there breaks DHCP).
+  let autoScanned = false;
+  $effect(() => { if (!autoScanned && app.info && !busy) { autoScanned = true; scan(false); } });
 </script>
 
 <div class="setup" data-testid="setup">
@@ -91,15 +99,30 @@
     <li class:on={step === 'saving' || step === 'saved'}><span>3</span>Connect</li>
   </ol>
 
+  {#if rn && step !== 'saved'}
+    <div class="card note {rn.safe ? 'critc' : 'warnc'}" data-testid="reset-notice">
+      {#if rn.safe}<b>Safe mode: mining is paused.</b> <span>The miner restarted unexpectedly {rn.count > 1 ? `${rn.count} times in a row` : ''}. Last: {rn.text}.</span>
+        <div class="mute small">Wi-Fi and this page still work. When the cause is fixed, restart normally.</div>
+        <button class="pri" onclick={restartNormal} disabled={leaving} data-testid="leave-safe">{leaving ? 'Restarting…' : 'Restart normally'}</button>
+      {:else}<b>The miner restarted unexpectedly.</b> <span>{rn.text}.</span>{#if rn.wifi}<div class="mute small">Wi-Fi status at the time: {rn.wifi}</div>{/if}{/if}
+    </div>
+  {/if}
+
   {#if failed && step === 'list'}
-    <div class="card note warnc" data-testid="join-failed"><b>Couldn't join “{i.ssid}”.</b> <span>{failed}</span><div class="mute small">Pick your network again and re-enter the password.</div></div>
+    <div class="card note warnc" data-testid="join-failed"><b>Couldn't join “{failed.ssid}”: {failed.text}</b>
+      {#if failed.hint}<span>{failed.hint}</span>{/if}
+      <div class="mute small mono" data-testid="join-failed-code">{failed.reason ? `Error ${failed.reason}` : failed.status}{failed.retries ? ` · ${failed.retries} tries` : ''} · still retrying in the background</div>
+      <div class="mute small">{failed.code === 'password' ? 'Pick your network again and re-enter the password.' : 'Check the network, or pick it again below.'}</div></div>
+  {:else if busy && step === 'list'}
+    <div class="card note okc" data-testid="joining"><b>{js.kind === 'dhcp' ? `Joined “${js.ssid}”, getting an IP address…` : `Joining “${js.ssid}”…`}</b>
+      <span class="mute small">No need to type the password again. This normally takes under a minute; the hotspot closes by itself when it works.</span></div>
   {/if}
 
   {#if step === 'list'}
     <section class="card">
       <div class="head">
         <div><h1>Choose your Wi-Fi</h1><div class="mute small">{scanning ? 'Looking for networks near the miner…' : networks.length ? `${networks.length} network${networks.length === 1 ? '' : 's'} found · tap yours` : scannedOnce ? 'Nothing found yet' : ''}</div></div>
-        <button class="icon" onclick={() => scan(true, 2)} disabled={scanning} aria-label="Rescan" data-testid="rescan"><span class:spin={scanning}>↻</span> Rescan</button>
+        <button class="icon" onclick={() => scan(true, 2)} disabled={scanning || busy} title={busy ? 'Scanning waits until the miner has finished joining' : ''} aria-label="Rescan" data-testid="rescan"><span class:spin={scanning}>↻</span> Rescan</button>
       </div>
       {#if scanning && !networks.length}
         <div class="radar" aria-hidden="true"><i></i></div>
@@ -195,6 +218,8 @@ input{font-size:16px;padding:11px 12px}
 .skip{color:var(--mute);font-weight:500}
 .err{color:var(--crit)}
 .note{display:grid;gap:4px}.warnc{border-color:color-mix(in srgb,var(--warn) 55%,transparent);--tab:var(--warn)}
+.critc{border-color:color-mix(in srgb,var(--crit) 60%,transparent);--tab:var(--crit)}.okc{border-color:color-mix(in srgb,var(--acc2) 50%,transparent);--tab:var(--acc2)}
+.note .pri{justify-self:start;margin-top:4px}
 .mid{justify-items:center;text-align:center;padding:26px 18px}
 .spinner{width:44px;height:44px;border-radius:50%;border:3px solid #2a2e36;border-top-color:var(--acc);animation:sp .9s linear infinite}
 .ok-badge{width:56px;height:56px;border-radius:50%;display:grid;place-items:center;font:800 28px var(--ui);color:#04150e;background:linear-gradient(180deg,#5fe7d3,var(--acc2));box-shadow:0 0 24px #3fd8c255}

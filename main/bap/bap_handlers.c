@@ -6,6 +6,7 @@
  */
 
 #include <string.h>
+#include "costean/boot_guard.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_log.h"
@@ -370,6 +371,8 @@ void BAP_handle_settings(const char *parameter, const char *value) {
                         vTaskDelay(pdMS_TO_TICKS(100));
                         BAP_send_message(BAP_CMD_STA, "status", "restarting");
                         vTaskDelay(pdMS_TO_TICKS(1000));
+                        nvs_config_flush(3000);
+                        boot_guard_restart_requested();
                         esp_restart();
                     } else {
                         if (existing_pass) free(existing_pass);
@@ -399,6 +402,8 @@ void BAP_handle_settings(const char *parameter, const char *value) {
                     //ESP_LOGI(TAG, "Restarting to apply new WiFi settings");
                     BAP_send_message(BAP_CMD_STA, "status", "restarting");
                     vTaskDelay(pdMS_TO_TICKS(1000));
+                    nvs_config_flush(3000);
+                    boot_guard_restart_requested();
                     esp_restart();
                 } else {
                     ESP_LOGE(TAG, "Failed to set WiFi password");

@@ -145,6 +145,7 @@ bool nvs_config_get_bool(NvsConfigKey key);
 void nvs_config_set_bool(NvsConfigKey key, bool value);
 bool nvs_config_has_key(NvsConfigKey key);
 uint32_t nvs_config_write_errors(void);   // failed NVS flash writes since boot
+bool nvs_config_flush(uint32_t timeout_ms); // wait until every queued setting is written to flash
 Settings *nvs_config_get_settings(NvsConfigKey key);
 
 #endif // MAIN_NVS_CONFIG_H

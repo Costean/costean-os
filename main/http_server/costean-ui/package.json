@@ -1,7 +1,7 @@
 {
   "name": "costean-bitaxe-ui",
   "private": true,
-  "version": "1.2.0-costean.5",
+  "version": "1.2.0-costean.7",
   "type": "module",
   "license": "GPL-3.0-or-later",
   "description": "Costean OS web UI for the Bitaxe Gamma 602 (ESP-Miner 2.15.4 API)",

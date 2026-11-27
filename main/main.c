@@ -33,6 +33,7 @@
 #include "log_buffer.h"
 #include "setup_ble.h"
 #include "esp_ota_ops.h"
+#include "costean/boot_guard.h"
 
 static GlobalState GLOBAL_STATE;
 
@@ -104,6 +105,11 @@ void app_main(void)
         return;
     }
 
+    // Costean OS: record why the previous run ended and decide on safe mode (after repeated quick crashes).
+    boot_guard_init();
+    boot_guard_set_phase(BG_PHASE_BOOT);
+    bool safe_mode = boot_guard_safe_mode();
+
     // Check firmware version migration (resets useCustomWWW on update/downgrade)
     SYSTEM_check_firmware_migration();
 
@@ -155,8 +161,11 @@ void app_main(void)
     }
 
     if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+        boot_guard_set_phase(BG_PHASE_WIFI_START);
         wifi_init(&GLOBAL_STATE);
     }
+    // A reset counts as "quick" only if it comes within the first 2 minutes.
+    boot_guard_start_stable_timer();
 
     esp_err_t system_init_ret = SYSTEM_init_peripherals(&GLOBAL_STATE);
     
@@ -197,17 +206,48 @@ void app_main(void)
     // configured over Bluetooth. A short grace period avoids spinning up BLE on
     // a normal boot that connects within a few seconds. setup_ble_start() is
     // idempotent and only takes effect once the AP is actually enabled.
+    //
+    // Costean OS (costean.6): with a saved network, BLE is no longer started 5 s into a normal join (that put BLE
+    // on the radio exactly while the miner was getting its IP, then tore it down again on connect). It only starts
+    // with no Wi-Fi saved, or after the saved network has failed for 90 s. Never in safe mode.
+    bool has_ssid = GLOBAL_STATE.SYSTEM_MODULE.ssid && GLOBAL_STATE.SYSTEM_MODULE.ssid[0] != '\0';
     int setup_ble_grace_ms = 0;
+    bool ble_started = false;
     while (!GLOBAL_STATE.SYSTEM_MODULE.is_connected) {
-        if (GLOBAL_STATE.SYSTEM_MODULE.ap_enabled && setup_ble_grace_ms >= 5000) {
+        if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+            wifi_link_t link = wifi_link_state();
+            boot_guard_set_phase(link == WIFI_LINK_DHCP ? BG_PHASE_DHCP : link == WIFI_LINK_JOINING ? BG_PHASE_JOINING : BG_PHASE_WIFI_START);
+            boot_guard_note_wifi(GLOBAL_STATE.SYSTEM_MODULE.wifi_status);
+        }
+        int ble_grace = has_ssid ? 90000 : 5000;
+        if (!safe_mode && GLOBAL_STATE.SYSTEM_MODULE.ap_enabled && setup_ble_grace_ms >= ble_grace) {
             setup_ble_start(&GLOBAL_STATE);
+            ble_started = true;
         }
         setup_ble_grace_ms += 100;
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
+    boot_guard_set_phase(BG_PHASE_GOT_IP);
+    boot_guard_note_wifi(GLOBAL_STATE.SYSTEM_MODULE.wifi_status);
 
-    // Connected to WiFi: tear down the setup BLE service to free the radio.
-    setup_ble_stop();
+    // Connected to WiFi: tear down the setup BLE service to free the radio (only if it was started).
+    if (ble_started) {
+        setup_ble_stop();
+    }
+
+    if (safe_mode && !GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+        // Safe mode: Wi-Fi and the web UI only. The ASIC stays in reset, no mining or Costean services start, so a
+        // crash in any of them cannot loop. The OLED and the web UI explain how to leave safe mode.
+        static char safe_msg[320];
+        char why[120];
+        boot_guard_describe_last(why, sizeof(why));
+        snprintf(safe_msg, sizeof(safe_msg), "Mining paused after repeated restarts%s%s. Open http://%s and tap Restart normally.",
+                 why[0] ? ": " : "", why, GLOBAL_STATE.SYSTEM_MODULE.ip_addr_str);
+        GLOBAL_STATE.SYSTEM_MODULE.asic_status = safe_msg;
+        boot_guard_set_phase(BG_PHASE_RUNNING);
+        ESP_LOGW(TAG, "Safe mode: %s", safe_msg);
+        return;
+    }
 
     queue_init(&GLOBAL_STATE.stratum_queue);
 
@@ -219,6 +259,7 @@ void app_main(void)
         GLOBAL_STATE.stratum_protocol = STRATUM_PROTOCOL_V1;
     }
 
+    boot_guard_set_phase(BG_PHASE_ASIC_INIT);
     if (system_init_ret == ESP_OK) {
         if (asic_initialize(&GLOBAL_STATE, ASIC_INIT_COLD_BOOT, 0) == 0) {
             if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
@@ -244,6 +285,7 @@ void app_main(void)
         }
     }
 
+    boot_guard_set_phase(BG_PHASE_SERVICES);
     if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
         discord_alerts_start(&GLOBAL_STATE);
         costean_init(&GLOBAL_STATE);
@@ -260,6 +302,7 @@ void app_main(void)
         }
     }
 
+    boot_guard_set_phase(BG_PHASE_RUNNING);
     if (GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
         GLOBAL_STATE.SELF_TEST_MODULE.system_init_ret = system_init_ret;
         if (xTaskCreateWithCaps(self_test_task, "self_test", 8192, (void *) &GLOBAL_STATE, 10, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {

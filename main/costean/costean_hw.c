@@ -1,3 +1,4 @@
+#include <string.h>
 #include "costean_hw.h"
 
 #include <math.h>
@@ -12,6 +13,7 @@ void costean_hw_set_global(GlobalState *gs) { G = gs; }
 
 void costean_hw_read(costean_hw_t *o)
 {
+    if (!G) { memset(o, 0, sizeof(*o)); return; }   // safe mode: Costean services never started
     PowerManagementModule *pm = &G->POWER_MANAGEMENT_MODULE;
     SystemModule *sm = &G->SYSTEM_MODULE;
     o->chip_c = pm->chip_temp2_avg > pm->chip_temp_avg ? pm->chip_temp2_avg : pm->chip_temp_avg;

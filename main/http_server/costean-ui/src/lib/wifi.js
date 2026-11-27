@@ -54,3 +54,38 @@ export function ssidProblem(ssid) {
   if (new TextEncoder().encode(s).length > 32) return 'Network names are at most 32 bytes.';
   return '';
 }
+
+// costean.6: what the miner's Wi-Fi is doing right now, from /api/system/info.
+// kind: idle (nothing saved) | joining | dhcp (joined, waiting for an IP) | failed | connected
+export function joinState(info) {
+  const i = info || {};
+  const ssid = i.ssid && i.ssid !== 'Unknown' ? i.ssid : '';
+  const status = String(i.wifiStatus || '');
+  if (!ssid || /^Setup/.test(status)) return { kind: 'idle', ssid };
+  if (i.wifiLink === 'up' || /^Connected/.test(status)) return { kind: 'connected', ssid };
+  const err = status.match(/Error (\d+)/);
+  const code = i.wifiFailCode || '';
+  if (code || err || /timeout/i.test(status)) {
+    const reason = Number(i.wifiFailReason) || (err ? Number(err[1]) : 0);
+    const retry = status.match(/retry #(\d+)/);
+    return {
+      kind: 'failed', ssid, code: code || (reason === 15 || reason === 204 ? 'password' : reason === 201 ? 'not_found' : 'other'),
+      text: i.wifiFailText || status.replace(/\s*\(.*\)\s*$/, '') || 'Could not connect',
+      hint: i.wifiFailHint || '', reason, retries: Number(i.wifiRetries) || (retry ? Number(retry[1]) : 0), status,
+    };
+  }
+  if (i.wifiLink === 'dhcp' || /Acquiring IP/i.test(status)) return { kind: 'dhcp', ssid, status };
+  return { kind: 'joining', ssid, status };
+}
+
+// Why the previous run ended, when it was not on purpose (crash, watchdog, brownout). null when it was normal.
+export function resetNotice(info) {
+  const i = info || {};
+  if (!i.lastResetUnexpected && !i.safeMode) return null;
+  return {
+    safe: !!i.safeMode,
+    text: i.lastResetText || i.lastResetReason || 'Unexpected restart',
+    wifi: i.lastResetWifi || '',
+    count: Number(i.quickResets) || 0,
+  };
+}

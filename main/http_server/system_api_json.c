@@ -22,6 +22,7 @@
 #include "statistics_task.h"
 #include "stratum_v2_task.h"
 #include "asic.h"
+#include "costean/boot_guard.h"
 
 
 static const char *get_reset_reason_str(esp_reset_reason_t reason)
@@ -174,6 +175,29 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
     cJSON_AddStringToObject(root, "ipv4", g->SYSTEM_MODULE.ip_addr_str);
     cJSON_AddStringToObject(root, "ipv6", g->SYSTEM_MODULE.ipv6_addr_str);
     cJSON_AddNumberToObject(root, "apEnabled", g->SYSTEM_MODULE.ap_enabled ? 1 : 0);
+    // Costean OS (costean.6): why the last Wi-Fi join failed, and why the previous run ended.
+    {
+        wifi_fail_t wf = wifi_last_fail();
+        wifi_link_t wl = wifi_link_state();
+        cJSON_AddStringToObject(root, "wifiLink", wl == WIFI_LINK_UP ? "up" : wl == WIFI_LINK_DHCP ? "dhcp" : wl == WIFI_LINK_JOINING ? "joining" : "idle");
+        cJSON_AddNumberToObject(root, "wifiFailReason", wifi_last_disconnect_reason());
+        cJSON_AddStringToObject(root, "wifiFailCode", wifi_fail_code(wf));
+        cJSON_AddStringToObject(root, "wifiFailText", wifi_fail_text(wf));
+        cJSON_AddStringToObject(root, "wifiFailHint", wifi_fail_hint(wf));
+        cJSON_AddNumberToObject(root, "wifiRetries", wifi_retry_count());
+        const bg_state_t *bg = boot_guard_state();
+        char last[160];
+        boot_guard_describe_last(last, sizeof(last));
+        cJSON_AddStringToObject(root, "lastResetReason", bg_reason_text(bg->last_reason));
+        cJSON_AddNumberToObject(root, "lastResetCode", bg->last_reason);
+        cJSON_AddStringToObject(root, "lastResetPhase", bg->last_phase ? bg_phase_text(bg->last_phase) : "");
+        cJSON_AddBoolToObject(root, "lastResetUnexpected", bg->last_unexpected);
+        cJSON_AddStringToObject(root, "lastResetText", last);
+        cJSON_AddStringToObject(root, "lastResetWifi", boot_guard_last_wifi());
+        cJSON_AddNumberToObject(root, "bootCount", bg->boots);
+        cJSON_AddNumberToObject(root, "quickResets", bg->quick);
+        cJSON_AddNumberToObject(root, "safeMode", bg->safe ? 1 : 0);
+    }
     cJSON_AddStringToObject(root, "apSsid", g->SYSTEM_MODULE.ap_ssid);   // setup hotspot name (Costean OS setup page)
 
     // Pool Configuration

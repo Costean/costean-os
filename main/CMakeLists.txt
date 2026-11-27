@@ -58,6 +58,8 @@ SRCS
     "./costean/lode_oled.c"
     "./costean/lode_font.c"
     "./costean/ota_check.c"
+    "./costean/boot_guard_logic.c"
+    "./costean/boot_guard.c"
     "./tasks/power_management_task.c"
     "./tasks/statistics_task.c"
     "./tasks/scoreboard.c"
